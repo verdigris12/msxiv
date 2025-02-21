@@ -7,17 +7,17 @@
 #include <math.h>
 
 #include <X11/Xutil.h>
-/* Removed XFixes / Xrender includes, as you said you commented them out:
-// #include <X11/extensions/Xfixes.h>
-// #include <X11/extensions/Xrender.h>
-*/
-
 #include <MagickWand/MagickWand.h>
+
+/* Command bar geometry and font selection */
+#define CMD_BAR_HEIGHT 15
+#define CMD_BAR_FONT   "monospace"   /* fallback to "fixed" if not found */
 
 #define ZOOM_STEP 0.1
 #define MIN_ZOOM 0.1
 #define MAX_ZOOM 20.0
 
+/* State for the currently displayed image. */
 static MagickWand *g_wand = NULL;
 static int g_img_width = 0;
 static int g_img_height = 0;
@@ -25,43 +25,104 @@ static int g_pan_x = 0;
 static int g_pan_y = 0;
 static double g_zoom = 1.0;
 
+/* Current filename + config pointer */
 static char g_filename[1024] = {0};
 static MsxivConfig *g_config = NULL;
 
-/* We'll store the background pixel in a global after we parse the color. */
-static unsigned long g_bg_pixel = 0;
-
-/* For the : command line input */
+/* Command line mode input */
 static char g_command_input[1024] = {0};
 static int g_command_mode = 0;
 static int g_command_len = 0;
 
+/* Colors/pixels for background, text, cmd bar. */
+static unsigned long g_bg_pixel = 0;
+static unsigned long g_text_pixel = 0;
+static unsigned long g_cmdbar_bg_pixel = 0;
+
+/* Font for the command bar text */
+static XFontStruct *g_cmdFont = NULL;
+
+/* WM_DELETE_WINDOW atom, for window close events. */
+static Atom wmDeleteMessage;
+
+/*
+ * Forward declarations
+ */
+static void load_image(Display *dpy, Window win, const char *filename);
+static void render_image(Display *dpy, Window win);
+
+/*
+ * Helper: Fit the image to the window, resetting pan/zoom.
+ */
+static void fit_zoom(Display *dpy, Window win)
+{
+	XWindowAttributes xwa;
+	XGetWindowAttributes(dpy, win, &xwa);
+	int win_w = xwa.width;
+	int win_h = xwa.height;
+
+	double sx = (double)win_w / (double)g_img_width;
+	double sy = (double)win_h / (double)g_img_height;
+	g_zoom = (sx < sy) ? sx : sy;
+	g_pan_x = 0;
+	g_pan_y = 0;
+}
+
+/*
+ * Load a new file into the wand, reset zoom/pan, set g_filename, then render.
+ */
+static void load_image(Display *dpy, Window win, const char *filename)
+{
+	if (g_wand) {
+		DestroyMagickWand(g_wand);
+		g_wand = NULL;
+	}
+	g_wand = NewMagickWand();
+	if (MagickReadImage(g_wand, filename) == MagickFalse) {
+		fprintf(stderr, "Failed to read image: %s\n", filename);
+		DestroyMagickWand(g_wand);
+		g_wand = NULL;
+		return;
+	}
+
+	strncpy(g_filename, filename, sizeof(g_filename) - 1);
+	g_filename[sizeof(g_filename) - 1] = '\0';
+
+	g_img_width = (int)MagickGetImageWidth(g_wand);
+	g_img_height = (int)MagickGetImageHeight(g_wand);
+	g_zoom = 1.0;
+	g_pan_x = 0;
+	g_pan_y = 0;
+
+	render_image(dpy, win);
+}
+
+/*
+ * Actually draw the image in the window, plus the command bar if in command mode.
+ */
 static void render_image(Display *dpy, Window win)
 {
 	if (!g_wand) {
 		return;
 	}
-
 	XWindowAttributes xwa;
 	XGetWindowAttributes(dpy, win, &xwa);
-
 	int win_w = xwa.width;
 	int win_h = xwa.height;
 
-	/* Clear the background to user-specified color */
 	GC gc = DefaultGC(dpy, DefaultScreen(dpy));
+	/* Clear the background using g_bg_pixel. */
 	XSetForeground(dpy, gc, g_bg_pixel);
 	XFillRectangle(dpy, win, gc, 0, 0, win_w, win_h);
 
-	/* Now draw the scaled image. */
 	double scaled_w = g_img_width * g_zoom;
 	double scaled_h = g_img_height * g_zoom;
 
-	MagickWand *tmp_wand = CloneMagickWand(g_wand);
-	/* 4-argument call for some IM7 builds: */
-	MagickResizeImage(tmp_wand, (size_t)scaled_w, (size_t)scaled_h, LanczosFilter);
+	MagickWand *tmp = CloneMagickWand(g_wand);
+	/* Some ImageMagick builds want 4-arg, no 'blur' param. */
+	MagickResizeImage(tmp, (size_t)scaled_w, (size_t)scaled_h, LanczosFilter);
 
-	/* Clamp pan so we don't scroll out of bounds */
+	/* Clamp pan so we don't go off the edges. */
 	if (g_pan_x > (int)scaled_w - 1) g_pan_x = (int)scaled_w - 1;
 	if (g_pan_y > (int)scaled_h - 1) g_pan_y = (int)scaled_h - 1;
 	if (g_pan_x < 0) g_pan_x = 0;
@@ -70,100 +131,91 @@ static void render_image(Display *dpy, Window win)
 	int copy_w = (win_w > (int)scaled_w) ? (int)scaled_w : win_w;
 	int copy_h = (win_h > (int)scaled_h) ? (int)scaled_h : win_h;
 
-	MagickCropImage(tmp_wand, copy_w, copy_h, g_pan_x, g_pan_y);
-	MagickSetImageFormat(tmp_wand, "RGBA");
+	MagickCropImage(tmp, copy_w, copy_h, g_pan_x, g_pan_y);
+	MagickSetImageFormat(tmp, "RGBA");
 
-	size_t out_width = MagickGetImageWidth(tmp_wand);
-	size_t out_height = MagickGetImageHeight(tmp_wand);
-	size_t length = out_width * out_height * 4;
-	unsigned char *blob = MagickGetImageBlob(tmp_wand, &length);
+	size_t out_w = MagickGetImageWidth(tmp);
+	size_t out_h = MagickGetImageHeight(tmp);
+	size_t length = out_w * out_h * 4;
+	unsigned char *blob = MagickGetImageBlob(tmp, &length);
 
-	/* Create XImage for the final region. */
-	XImage *ximg = XCreateImage(dpy, DefaultVisual(dpy, DefaultScreen(dpy)), 24,
-	                            ZPixmap, 0,
-	                            (char *)malloc(out_width * out_height * 4),
-	                            out_width, out_height, 32, 0);
+	XImage *ximg = XCreateImage(dpy,
+	                            DefaultVisual(dpy, DefaultScreen(dpy)),
+	                            24, ZPixmap,
+	                            0,
+	                            (char *)malloc(out_w * out_h * 4),
+	                            out_w, out_h,
+	                            32, 0);
 	if (!ximg) {
 		MagickRelinquishMemory(blob);
-		DestroyMagickWand(tmp_wand);
+		DestroyMagickWand(tmp);
 		return;
 	}
+	memcpy(ximg->data, blob, out_w * out_h * 4);
 
-	memcpy(ximg->data, blob, out_width * out_height * 4);
-
-	/* CHANGED: We center the image if smaller than window. */
+	/* Center the image if it's smaller than the window. */
 	int pos_x = 0;
 	int pos_y = 0;
-	if ((int)out_width < win_w) {
-		pos_x = (win_w - (int)out_width) / 2;
+	if ((int)out_w < win_w) {
+		pos_x = (win_w - (int)out_w) / 2;
 	}
-	if ((int)out_height < win_h) {
-		pos_y = (win_h - (int)out_height) / 2;
+	if ((int)out_h < win_h) {
+		pos_y = (win_h - (int)out_h) / 2;
 	}
 
-	XPutImage(dpy, win, gc, ximg, 0, 0, pos_x, pos_y, out_width, out_height);
+	XPutImage(dpy, win, gc, ximg, 0, 0, pos_x, pos_y, out_w, out_h);
 
 	XFree(ximg);
 	MagickRelinquishMemory(blob);
-	DestroyMagickWand(tmp_wand);
+	DestroyMagickWand(tmp);
+
+	/* If in command mode, draw a black bar + white text at the bottom. */
+	if (g_command_mode) {
+		int bar_y = win_h - CMD_BAR_HEIGHT;
+
+		XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
+		XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
+
+		char display_cmd[1024];
+		snprintf(display_cmd, sizeof(display_cmd), ":%s", g_command_input);
+
+		XSetForeground(dpy, gc, g_text_pixel);
+		if (g_cmdFont) {
+			XSetFont(dpy, gc, g_cmdFont->fid);
+		}
+
+		/* We'll place text a little up from the bar's bottom. */
+		int text_x = 5;
+		int text_y = bar_y + CMD_BAR_HEIGHT - 3;
+
+		XDrawString(dpy, win, gc, text_x, text_y,
+		            display_cmd, strlen(display_cmd));
+	}
 }
 
-static void fit_zoom(Display *dpy, Window win)
-{
-	if (!g_wand) return;
-
-	XWindowAttributes xwa;
-	XGetWindowAttributes(dpy, win, &xwa);
-
-	int win_w = xwa.width;
-	int win_h = xwa.height;
-
-	double scale_x = (double)win_w / (double)g_img_width;
-	double scale_y = (double)win_h / (double)g_img_height;
-	g_zoom = scale_x < scale_y ? scale_x : scale_y;
-
-	g_pan_x = 0;
-	g_pan_y = 0;
-}
-
-int viewer_init(Display **dpy, Window *win, const char *filename, MsxivConfig *config)
+/*
+ * viewer_init() sets up X, loads background color, loads first image if any, etc.
+ */
+int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config)
 {
 	MagickWandGenesis();
-
 	g_config = config;
-	strncpy(g_filename, filename, sizeof(g_filename) - 1);
+	g_wand = NULL;
 
-	g_wand = NewMagickWand();
-	if (MagickReadImage(g_wand, filename) == MagickFalse) {
-		fprintf(stderr, "Failed to read image: %s\n", filename);
-		DestroyMagickWand(g_wand);
-		g_wand = NULL;
-		return -1;
-	}
-
-	g_img_width = (int)MagickGetImageWidth(g_wand);
-	g_img_height = (int)MagickGetImageHeight(g_wand);
-	g_zoom = 1.0;
-	g_pan_x = 0;
-	g_pan_y = 0;
-
-	/* OPEN DISPLAY */
 	*dpy = XOpenDisplay(NULL);
 	if (!*dpy) {
 		fprintf(stderr, "Cannot open display\n");
 		return -1;
 	}
 	int screen = DefaultScreen(*dpy);
-	int win_w = (g_img_width < 800) ? g_img_width : 800;
-	int win_h = (g_img_height < 600) ? g_img_height : 600;
 
-	*win = XCreateSimpleWindow(*dpy,
-	                           RootWindow(*dpy, screen),
-	                           0, 0,
-	                           win_w, win_h,
-	                           1,
-	                           BlackPixel(*dpy, screen),
-	                           WhitePixel(*dpy, screen));
+	*win = XCreateSimpleWindow(
+		*dpy, RootWindow(*dpy, screen),
+		0, 0, 800, 600,
+		1,
+		BlackPixel(*dpy, screen),
+		WhitePixel(*dpy, screen)
+	);
 
 	XSelectInput(*dpy, *win,
 	             ExposureMask |
@@ -172,36 +224,69 @@ int viewer_init(Display **dpy, Window *win, const char *filename, MsxivConfig *c
 	             ButtonReleaseMask |
 	             PointerMotionMask |
 	             StructureNotifyMask);
+
+	/* So we can detect window close. */
+	wmDeleteMessage = XInternAtom(*dpy, "WM_DELETE_WINDOW", False);
+	XSetWMProtocols(*dpy, *win, &wmDeleteMessage, 1);
+
 	XMapWindow(*dpy, *win);
 
-	/* WAIT FOR MAP */
+	/* Wait for MapNotify */
 	XEvent e;
 	while (1) {
 		XNextEvent(*dpy, &e);
-		if (e.type == MapNotify)
+		if (e.type == MapNotify) {
 			break;
+		}
 	}
 
-	/* CHANGED: parse & allocate background color from config->bg_color. */
 	{
 		Colormap cmap = DefaultColormap(*dpy, screen);
 		XColor xcol;
+		/* background color from config->bg_color */
 		if (XParseColor(*dpy, cmap, config->bg_color, &xcol) &&
 		    XAllocColor(*dpy, cmap, &xcol)) {
 			g_bg_pixel = xcol.pixel;
 		} else {
-			/* If that fails, fallback to black. */
+			/* fallback if parse fails */
 			g_bg_pixel = BlackPixel(*dpy, screen);
 		}
+	}
+
+	g_text_pixel = WhitePixel(*dpy, screen);
+
+	/* force black for the command bar background */
+	{
+		Colormap cmap = DefaultColormap(*dpy, screen);
+		XColor xcol;
+		if (XParseColor(*dpy, cmap, "#000000", &xcol) &&
+		    XAllocColor(*dpy, cmap, &xcol)) {
+			g_cmdbar_bg_pixel = xcol.pixel;
+		} else {
+			g_cmdbar_bg_pixel = BlackPixel(*dpy, screen);
+		}
+	}
+
+	/* Load the monospace font. */
+	g_cmdFont = XLoadQueryFont(*dpy, CMD_BAR_FONT);
+	if (!g_cmdFont) {
+		g_cmdFont = XLoadQueryFont(*dpy, "fixed");
+	}
+
+	/* Load first image if we have multiple. */
+	if (vdata->fileCount > 0) {
+		load_image(*dpy, *win, vdata->files[vdata->currentIndex]);
 	}
 
 	return 0;
 }
 
-void viewer_run(Display *dpy, Window win)
+/*
+ * The main event loop. 
+ * KeyPress now uses XLookupString to detect typed ASCII (including ':').
+ */
+void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 {
-	render_image(dpy, win);
-
 	XEvent ev;
 	int is_ctrl_pressed = 0;
 
@@ -209,20 +294,39 @@ void viewer_run(Display *dpy, Window win)
 		XNextEvent(dpy, &ev);
 		switch (ev.type) {
 		case Expose:
-			render_image(dpy, win);
-			break;
 		case ConfigureNotify:
 			render_image(dpy, win);
 			break;
+		case ClientMessage:
+			/* WM_DELETE_WINDOW => exit. */
+			if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) {
+				return;
+			}
+			break;
+		case DestroyNotify:
+			return;
 		case KeyPress: {
-			KeySym ks = XLookupKeysym(&ev.xkey, 0);
+			/*
+			 * We use XLookupString to detect typed ASCII.
+			 * Then we also check KeySym for special keys like arrow, space, backspace.
+			 */
+			char buf[32];
+			KeySym ks;
+			XComposeStatus comp;
+			int len = XLookupString(&ev.xkey, buf, sizeof(buf) - 1, &ks, &comp);
+			buf[len] = '\0';
 
-			/* Handle command mode (:) input first. */
 			if (g_command_mode) {
+				/*
+				 * If we are in command mode, typed ASCII goes into the command buffer,
+				 * unless it's Enter, BackSpace, or Escape, etc.
+				 */
 				if (ks == XK_Return) {
+					/* finalize command */
 					g_command_input[g_command_len] = '\0';
 					g_command_mode = 0;
 
+					/* parse command */
 					if (strncmp(g_command_input, "save", 4) == 0) {
 						cmd_save(g_filename);
 					} else if (strncmp(g_command_input, "convert", 7) == 0) {
@@ -230,11 +334,10 @@ void viewer_run(Display *dpy, Window win)
 					} else if (strncmp(g_command_input, "delete", 6) == 0) {
 						cmd_delete(g_filename);
 					} else if (strncmp(g_command_input, "bookmark", 8) == 0) {
-						char *label = g_command_input + 8;
-						while (*label == ' ' || *label == '\t') label++;
-						cmd_bookmark(g_filename, label, g_config);
+						char *lbl = g_command_input + 8;
+						while (*lbl == ' ' || *lbl == '\t') lbl++;
+						cmd_bookmark(g_filename, lbl, g_config);
 					}
-
 					g_command_len = 0;
 					g_command_input[0] = '\0';
 					render_image(dpy, win);
@@ -243,119 +346,150 @@ void viewer_run(Display *dpy, Window win)
 						g_command_len--;
 						g_command_input[g_command_len] = '\0';
 					}
+					render_image(dpy, win);
 				} else if (ks == XK_Escape) {
 					g_command_mode = 0;
 					g_command_len = 0;
 					g_command_input[0] = '\0';
+					render_image(dpy, win);
 				} else {
-					char c = (char)XLookupKeysym(&ev.xkey, 0);
-					if (c >= 32 && c < 127 &&
-					    g_command_len < (int)(sizeof(g_command_input) - 1)) {
-						g_command_input[g_command_len++] = c;
-						g_command_input[g_command_len] = '\0';
-					}
-				}
-				break;
-			}
-
-			/* If user pressed ':', enter command mode. */
-			if (ks == XK_colon) {
-				g_command_mode = 1;
-				g_command_len = 0;
-				g_command_input[0] = '\0';
-				break;
-			}
-
-			is_ctrl_pressed = (ev.xkey.state & ControlMask) != 0;
-
-			/* Normal panning/zooming or config key binds. */
-			switch (ks) {
-			case XK_q:
-				return;
-			case XK_w:
-			case XK_Up:
-				g_pan_y -= 50;
-				break;
-			case XK_s:
-			case XK_Down:
-				g_pan_y += 50;
-				break;
-			case XK_a:
-			case XK_Left:
-				g_pan_x -= 50;
-				break;
-			case XK_d:
-			case XK_Right:
-				g_pan_x += 50;
-				break;
-			case XK_plus:
-			case XK_equal:
-				if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
-					/* '=' without shift => fit to window. */
-					fit_zoom(dpy, win);
-					break;
-				}
-				/* otherwise, it's '+' */
-				g_zoom += ZOOM_STEP;
-				if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
-				break;
-			case XK_minus:
-				g_zoom -= ZOOM_STEP;
-				if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
-				break;
-			default: {
-				/* Check config keybinds. */
-				char pressed_key[32];
-				if (ks >= XK_space && ks <= XK_asciitilde) {
-					snprintf(pressed_key, sizeof(pressed_key), "%c", (char)ks);
-				} else {
-					snprintf(pressed_key, sizeof(pressed_key), "%lu", (unsigned long)ks);
-				}
-				for (int i = 0; i < g_config->keybind_count; i++) {
-					if (strcmp(g_config->keybinds[i].key, pressed_key) == 0) {
-						if (strncmp(g_config->keybinds[i].action, "save", 4) == 0) {
-							cmd_save(g_filename);
-						} else if (strncmp(g_config->keybinds[i].action, "convert", 7) == 0) {
-							cmd_convert(g_filename);
-						} else if (strncmp(g_config->keybinds[i].action, "delete", 6) == 0) {
-							cmd_delete(g_filename);
-						} else if (strncmp(g_config->keybinds[i].action, "bookmark", 8) == 0) {
-							char *label = (char *)g_config->keybinds[i].action + 8;
-							while (*label == ' ' || *label == '\t') label++;
-							cmd_bookmark(g_filename, label, g_config);
-						} else if (strncmp(g_config->keybinds[i].action, "exec ", 5) == 0) {
-							/* run shell command, ignoring return code. */
-							char cmd[1024];
-							const char *templ = g_config->keybinds[i].action + 5;
-							char *p = cmd;
-							const char *t = templ;
-							while (*t && (p - cmd) < (int)(sizeof(cmd) - 1)) {
-								if (*t == '%' && *(t+1) == 's') {
-									snprintf(p, sizeof(cmd) - (p - cmd), "%s", g_filename);
-									p += strlen(g_filename);
-									t += 2;
-								} else {
-									*p++ = *t++;
-								}
-							}
-							*p = '\0';
-							(void)system(cmd);
+					/* Add typed ASCII to command buffer if it's printable. */
+					if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
+						if (g_command_len < (int)(sizeof(g_command_input) - 1)) {
+							g_command_input[g_command_len++] = buf[0];
+							g_command_input[g_command_len] = '\0';
 						}
 					}
+					render_image(dpy, win);
 				}
-			} break;
-			}
-			render_image(dpy, win);
-		} break;
+				break;
+			} else {
+				/* Not in command mode. Check if user typed ":" => enter command mode. */
+				if (len == 1 && buf[0] == ':') {
+					g_command_mode = 1;
+					g_command_len = 0;
+					g_command_input[0] = '\0';
+					render_image(dpy, win);
+					break;
+				}
+				/*
+				 * Otherwise, handle non-ASCII or special keys (like arrow keys) via ks.
+				 */
+				is_ctrl_pressed = (ev.xkey.state & ControlMask) != 0;
+
+				switch (ks) {
+				case XK_q:
+					return;
+				case XK_space:
+					/* Next image if available */
+					if (vdata->currentIndex < vdata->fileCount - 1) {
+						vdata->currentIndex++;
+						load_image(dpy, win, vdata->files[vdata->currentIndex]);
+					}
+					break;
+				case XK_BackSpace:
+					/* Previous image if available */
+					if (vdata->currentIndex > 0) {
+						vdata->currentIndex--;
+						load_image(dpy, win, vdata->files[vdata->currentIndex]);
+					}
+					break;
+				case XK_w:
+				case XK_Up:
+					g_pan_y -= 50;
+					render_image(dpy, win);
+					break;
+				case XK_s:
+				case XK_Down:
+					g_pan_y += 50;
+					render_image(dpy, win);
+					break;
+				case XK_a:
+				case XK_Left:
+					g_pan_x -= 50;
+					render_image(dpy, win);
+					break;
+				case XK_d:
+				case XK_Right:
+					g_pan_x += 50;
+					render_image(dpy, win);
+					break;
+				case XK_plus:
+				case XK_equal:
+					/* '=' without shift => fit window. */
+					if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
+						fit_zoom(dpy, win);
+					} else {
+						g_zoom += ZOOM_STEP;
+						if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
+					}
+					render_image(dpy, win);
+					break;
+				case XK_minus:
+					g_zoom -= ZOOM_STEP;
+					if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
+					render_image(dpy, win);
+					break;
+				default:
+					/*
+					 * Possibly a config-defined keybinding:
+					 * we compare the KeySym to user-defined strings,
+					 * or if len>0 and it's a single ASCII char, we can match that.
+					 */
+					for (int i = 0; i < g_config->keybind_count; i++) {
+						char pressed_key[32];
+						/* If we got a single ASCII char, use that. Otherwise, fallback to numeric. */
+						if (len == 1 && (buf[0] >= 32 && buf[0] < 127)) {
+							snprintf(pressed_key, sizeof(pressed_key), "%c", buf[0]);
+						} else {
+							/* store the KeySym in decimal */
+							snprintf(pressed_key, sizeof(pressed_key), "%lu", (unsigned long)ks);
+						}
+						if (strcmp(g_config->keybinds[i].key, pressed_key) == 0) {
+							if (strncmp(g_config->keybinds[i].action, "save", 4) == 0) {
+								cmd_save(g_filename);
+							} else if (strncmp(g_config->keybinds[i].action, "convert", 7) == 0) {
+								cmd_convert(g_filename);
+							} else if (strncmp(g_config->keybinds[i].action, "delete", 6) == 0) {
+								cmd_delete(g_filename);
+							} else if (strncmp(g_config->keybinds[i].action, "bookmark", 8) == 0) {
+								char *lbl = (char*)g_config->keybinds[i].action + 8;
+								while (*lbl == ' ' || *lbl == '\t') lbl++;
+								cmd_bookmark(g_filename, lbl, g_config);
+							} else if (strncmp(g_config->keybinds[i].action, "exec ", 5) == 0) {
+								char syscmd[1024];
+								const char *templ = g_config->keybinds[i].action + 5;
+								char *p = syscmd;
+								const char *t = templ;
+								while (*t && (p - syscmd) < (int)(sizeof(syscmd) - 1)) {
+									if (*t == '%' && *(t+1) == 's') {
+										snprintf(p, sizeof(syscmd) - (p - syscmd), "%s", g_filename);
+										p += strlen(g_filename);
+										t += 2;
+									} else {
+										*p++ = *t++;
+									}
+								}
+								*p = '\0';
+								(void)system(syscmd);
+							}
+							render_image(dpy, win);
+						}
+					}
+					break;
+				} /* end switch(ks) */
+			} /* end else (not in command mode) */
+		} break; /* end KeyPress */
 
 		case ButtonPress:
-			/* Ctrl + wheel for zoom. */
+			/* Ctrl + mouse wheel => zoom. */
 			if (ev.xbutton.button == 4) {
 				if (is_ctrl_pressed) {
 					g_zoom += ZOOM_STEP;
 					if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
 					g_pan_x = (int)((ev.xbutton.x + g_pan_x) * (1 + ZOOM_STEP)) - ev.xbutton.x;
 					g_pan_y = (int)((ev.xbutton.y + g_pan_y) * (1 + ZOOM_STEP)) - ev.xbutton.y;
+					render_image(dpy, win);
 				}
 			} else if (ev.xbutton.button == 5) {
 				if (is_ctrl_pressed) {
@@ -363,21 +497,22 @@ void viewer_run(Display *dpy, Window win)
 					if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
 					g_pan_x = (int)((ev.xbutton.x + g_pan_x) * (1 - ZOOM_STEP)) - ev.xbutton.x;
 					g_pan_y = (int)((ev.xbutton.y + g_pan_y) * (1 - ZOOM_STEP)) - ev.xbutton.y;
+					render_image(dpy, win);
 				}
 			}
-			render_image(dpy, win);
 			break;
-
 		case ButtonRelease:
 			break;
-
 		case MotionNotify:
-			/* If you want click-drag panning, track the mouse here. */
+			/* Implement drag panning if desired. */
 			break;
-		}
+		} /* end switch(ev.type) */
 	}
 }
 
+/*
+ * viewer_cleanup: free wand, terminate Magick, close X display.
+ */
 void viewer_cleanup(Display *dpy)
 {
 	if (g_wand) {
@@ -386,7 +521,14 @@ void viewer_cleanup(Display *dpy)
 	}
 	MagickWandTerminus();
 
+	/* Optionally free the font: 
+	 * if (g_cmdFont) {
+	 *     XFreeFont(dpy, g_cmdFont);
+	 * }
+	 */
+
 	if (dpy) {
 		XCloseDisplay(dpy);
 	}
 }
+

@@ -1,31 +1,28 @@
 #include "commands.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <libgen.h> /* for basename() */
+#include <libgen.h>
 
+/* A simple file copy helper, used by 'save' & 'bookmark'. */
 static int copy_file(const char *src, const char *dst)
 {
-	/* Very naive copy implementation */
-	FILE *fin, *fout;
-	char buf[8192];
-	size_t n;
-
-	fin = fopen(src, "rb");
+	FILE *fin = fopen(src, "rb");
 	if (!fin) {
 		return -1;
 	}
-	fout = fopen(dst, "wb");
+	FILE *fout = fopen(dst, "wb");
 	if (!fout) {
 		fclose(fin);
 		return -1;
 	}
-
+	char buf[8192];
+	size_t n;
 	while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
 		fwrite(buf, 1, n, fout);
 	}
-
 	fclose(fin);
 	fclose(fout);
 	return 0;
@@ -33,37 +30,42 @@ static int copy_file(const char *src, const char *dst)
 
 int cmd_save(const char *filename)
 {
-	/* Save a copy in the same directory with a suffix "_copy". */
+	/* Save a copy with "_copy" appended. */
 	char dst[1024];
-	char *base = basename((char *)filename);
-	if (!base) {
-		return -1;
-	}
 	snprintf(dst, sizeof(dst), "%s_copy", filename);
 	if (copy_file(filename, dst) == 0) {
-		fprintf(stderr, "Saved copy: %s\n", dst);
+		fprintf(stderr, "Saved copy as: %s\n", dst);
 		return 0;
 	}
+	fprintf(stderr, "Error saving %s\n", dst);
 	return -1;
 }
 
 int cmd_convert(const char *filename)
 {
-	/* Prompt user for a desired format, then use ImageMagick's "convert" from system(3). */
+	/* Ask user for a format, e.g. "png". Then call system("convert ...") */
 	char format[128] = {0};
-	char cmd[2048];
-	fprintf(stderr, "Enter target format (e.g. png, jpg): ");
+	fprintf(stderr, "Enter target format (e.g. png): ");
 	if (!fgets(format, sizeof(format), stdin)) {
 		return -1;
 	}
-	/* Strip newline */
-	format[strcspn(format, "\n")] = '\0';
+	format[strcspn(format, "\n")] = '\0'; /* strip newline */
 
-	snprintf(cmd, sizeof(cmd), "convert \"%s\" \"%s.%s\"", filename, filename, format);
+	if (strlen(format) == 0) {
+		fprintf(stderr, "No format specified.\n");
+		return -1;
+	}
+
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd), "convert \"%s\" \"%s.%s\"",
+	         filename, filename, format);
+
 	if (system(cmd) == 0) {
-		fprintf(stderr, "Converted %s to %s.%s\n", filename, filename, format);
+		fprintf(stderr, "Converted %s -> %s.%s\n",
+		        filename, filename, format);
 		return 0;
 	}
+	fprintf(stderr, "Conversion failed.\n");
 	return -1;
 }
 
@@ -73,28 +75,30 @@ int cmd_delete(const char *filename)
 		fprintf(stderr, "Deleted file: %s\n", filename);
 		return 0;
 	}
+	fprintf(stderr, "Error deleting file: %s\n", filename);
 	return -1;
 }
 
 int cmd_bookmark(const char *filename, const char *label, MsxivConfig *config)
 {
-	int i;
 	char *base = basename((char *)filename);
-	char dst[1024] = {0};
-
-	for (i = 0; i < config->bookmark_count; i++) {
+	if (!base) {
+		fprintf(stderr, "Invalid filename: %s\n", filename);
+		return -1;
+	}
+	for (int i = 0; i < config->bookmark_count; i++) {
 		if (strcmp(config->bookmarks[i].label, label) == 0) {
+			char dst[1024];
 			snprintf(dst, sizeof(dst), "%s/%s", config->bookmarks[i].directory, base);
 			if (copy_file(filename, dst) == 0) {
-				fprintf(stderr, "Bookmarked file to %s\n", dst);
+				fprintf(stderr, "Bookmarked to: %s\n", dst);
 				return 0;
-			} else {
-				fprintf(stderr, "Failed to copy file to %s\n", dst);
-				return -1;
 			}
+			fprintf(stderr, "Could not copy to: %s\n", dst);
+			return -1;
 		}
 	}
-
 	fprintf(stderr, "Bookmark label '%s' not found in config.\n", label);
 	return -1;
 }
+

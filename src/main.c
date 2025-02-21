@@ -8,24 +8,38 @@
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <image file>\n", argv[0]);
+		fprintf(stderr, "Usage: %s <image1> [image2 ...]\n", argv[0]);
 		return 1;
 	}
 
-	Display *dpy = NULL;
-	Window win = 0;
+	/* Load config from ~/.config/msxiv/config.toml if exists. */
 	MsxivConfig config;
 	if (load_config(&config) < 0) {
-		fprintf(stderr, "Warning: Could not load config.\n");
+		fprintf(stderr, "Warning: could not load config.\n");
 	}
 
-	if (viewer_init(&dpy, &win, argv[1], &config) != 0) {
+	/* Prepare file list from argv[1..] */
+	int fileCount = argc - 1;
+	char **files = &argv[1];
+
+	/* Create a struct for viewer data. */
+	ViewerData vdata;
+	vdata.fileCount = fileCount;
+	vdata.files = files;
+	vdata.currentIndex = 0;
+
+	/* Initialize viewer. */
+	Display *dpy = NULL;
+	Window win = 0;
+	if (viewer_init(&dpy, &win, &vdata, &config) != 0) {
 		return 1;
 	}
 
-	viewer_run(dpy, win);
-	viewer_cleanup(dpy);
+	/* Enter event loop (blocks until user quits or closes window). */
+	viewer_run(dpy, win, &vdata);
 
+	/* Cleanup. */
+	viewer_cleanup(dpy);
 	return 0;
 }
 

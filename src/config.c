@@ -10,37 +10,40 @@
 #define CONFIG_DIR ".config/msxiv"
 
 /*
- * Very naive parser for lines in .toml, focusing on:
- *
- * [keybinds]
- * c = "convert"
- *
- * [bookmarks]
- * personal = "/path/to/personal"
- *
- * [display]
- * background = "#000000"
- */
+   We parse a simple subset of TOML lines, focusing on:
+
+   [keybinds]
+   q = "delete"
+   c = "convert"
+
+   [bookmarks]
+   personal = "/some/path"
+
+   [display]
+   background = "#202020"
+*/
+
 static int parse_line(MsxivConfig *config, const char *section, char *line)
 {
 	char *eq, *key, *val;
 	size_t len;
 
+	/* Trim leading spaces */
 	while (*line == ' ' || *line == '\t') {
 		line++;
 	}
-
+	/* Skip blank or commented lines */
 	if (*line == '\0' || *line == '#') {
 		return 0;
 	}
-
+	/* If line starts with "[", we treat it as a section name, handled outside. */
 	if (line[0] == '[') {
-		return 0; /* handled externally */
+		return 0;
 	}
 
 	eq = strchr(line, '=');
 	if (!eq) {
-		return 0; /* invalid line or no '=' present */
+		return 0; /* invalid or no '=' line */
 	}
 
 	*eq = '\0';
@@ -53,12 +56,10 @@ static int parse_line(MsxivConfig *config, const char *section, char *line)
 		key[len - 1] = '\0';
 		len--;
 	}
-
-	/* Also trim leading spaces in val */
+	/* Trim leading spaces in val */
 	while (*val == ' ' || *val == '\t') {
 		val++;
 	}
-
 	/* Remove quotes if present */
 	if (*val == '\"') {
 		val++;
@@ -107,16 +108,17 @@ int load_config(MsxivConfig *config)
 
 	config->keybind_count = 0;
 	config->bookmark_count = 0;
-
-	/* NEW: default background color is black */
+	/* default background color is black */
 	snprintf(config->bg_color, sizeof(config->bg_color), "#000000");
 
+	/* Build path to ~/.config/msxiv/config.toml */
 	snprintf(path, sizeof(path), "%s/%s/%s",
 	         getenv("HOME") ? getenv("HOME") : ".",
-	         CONFIG_DIR, CONFIG_FILE_NAME);
+	         CONFIG_DIR,
+	         CONFIG_FILE_NAME);
 
 	if (stat(path, &st) != 0) {
-		/* No config file found, not an error, just no config. */
+		/* no config file => not an error, just no user config */
 		return 0;
 	}
 
@@ -132,20 +134,19 @@ int load_config(MsxivConfig *config)
 		if (len > 0 && line[len - 1] == '\n') {
 			line[len - 1] = '\0';
 		}
-
-		/* Check if it's a [section] line */
 		if (line[0] == '[') {
-			char *rbracket = strchr(line, ']');
-			if (rbracket) {
-				*rbracket = '\0';
-				snprintf(current_section, sizeof(current_section), "%s", line + 1);
+			char *rb = strchr(line, ']');
+			if (rb) {
+				*rb = '\0';
+				snprintf(current_section, sizeof(current_section),
+				         "%s", line + 1);
 			}
 			continue;
 		}
-
 		parse_line(config, current_section, line);
 	}
 
 	fclose(fp);
 	return 0;
 }
+
