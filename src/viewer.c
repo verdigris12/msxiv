@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <libgen.h>
 
 #include <X11/Xutil.h>
 #include <MagickWand/MagickWand.h>
@@ -45,14 +49,21 @@ static XFontStruct *g_cmdFont = NULL;
 /* WM_DELETE_WINDOW atom, for window close events. */
 static Atom wmDeleteMessage;
 
-/*
- * Forward declarations
- */
+/* Built-in commands we want to tab-complete. */
+static const char *g_builtin_cmds[] = {
+	"save",
+	"convert",
+	"delete",
+	"bookmark",
+	NULL
+};
+
+/* Forward declarations */
 static void load_image(Display *dpy, Window win, const char *filename);
 static void render_image(Display *dpy, Window win);
 
 /*
- * Helper: Fit the image to the window, resetting pan/zoom.
+ * Fit the image to the window, resetting pan/zoom.
  */
 static void fit_zoom(Display *dpy, Window win)
 {
@@ -69,7 +80,7 @@ static void fit_zoom(Display *dpy, Window win)
 }
 
 /*
- * Load a new file into the wand, reset zoom/pan, set g_filename, then render.
+ * load_image: read the new file into the wand, reset zoom/pan, draw it.
  */
 static void load_image(Display *dpy, Window win, const char *filename)
 {
@@ -98,7 +109,201 @@ static void load_image(Display *dpy, Window win, const char *filename)
 }
 
 /*
- * Actually draw the image in the window, plus the command bar if in command mode.
+ * Minimal helper for "~" expansion if needed (for path completion).
+ */
+static void expand_tilde(const char *in, char *out, size_t outsize)
+{
+	if (in[0] == '~' && (in[1] == '/' || in[1] == '\0')) {
+		const char *home = getenv("HOME");
+		if (!home) home = ".";
+		snprintf(out, outsize, "%s%s", home, in + 1);
+	} else {
+		snprintf(out, outsize, "%s", in);
+	}
+}
+
+/*
+ * Attempt to tab-complete a built-in command (save, convert, delete, bookmark).
+ * If there's a single match or longer prefix, fill it in.
+ */
+static int complete_builtin_cmd(char *buffer, size_t bufsz)
+{
+	/* skip leading ':' */
+	char *cmdstart = buffer + 1;
+	char *space = strchr(cmdstart, ' ');
+	if (space) {
+		/* user typed full command plus maybe arguments => no command completion now */
+		return 0;
+	}
+	/* partial command typed */
+	const char *partial = cmdstart;
+	int partial_len = strlen(partial);
+
+	int matches_found = 0;
+	const char *best_match = NULL;
+	int common_prefix_len = -1;
+
+	for (int i = 0; g_builtin_cmds[i]; i++) {
+		const char *cand = g_builtin_cmds[i];
+		if (strncmp(cand, partial, partial_len) == 0) {
+			matches_found++;
+			if (!best_match) {
+				best_match = cand;
+				common_prefix_len = (int)strlen(cand);
+			} else {
+				int c = 0;
+				while (best_match[c] && cand[c] && best_match[c] == cand[c]) {
+					c++;
+				}
+				if (c < common_prefix_len) {
+					common_prefix_len = c;
+				}
+			}
+		}
+	}
+	if (matches_found == 0) {
+		return 0;
+	}
+	if (matches_found == 1) {
+		/* fill entire command */
+		snprintf(cmdstart, bufsz - 1, "%s", best_match);
+		return 1;
+	} else {
+		/* multiple matches => fill up to the common prefix among them */
+		if (common_prefix_len <= partial_len) {
+			return 0; /* no improvement */
+		}
+		memcpy(cmdstart + partial_len, best_match + partial_len, common_prefix_len - partial_len);
+		cmdstart[common_prefix_len] = '\0';
+		return 1;
+	}
+}
+
+/*
+ * Attempt to tab-complete a path argument after a known command, e.g. ":save /some/pa<Tab>" 
+ */
+static int complete_path(char *buffer, size_t bufsz)
+{
+	/* find the space => parse partial path. */
+	char *space = strchr(buffer, ' ');
+	if (!space) {
+		return 0;
+	}
+	char *pathstart = space;
+	while (*pathstart == ' ' || *pathstart == '\t') {
+		pathstart++;
+	}
+	if (*pathstart == '\0') {
+		/* no partial typed => do nothing */
+		return 0;
+	}
+
+	char expanded[1024];
+	expand_tilde(pathstart, expanded, sizeof(expanded));
+
+	/* separate directory from partial base. */
+	char dir[1024];
+	char base[1024];
+	snprintf(dir, sizeof(dir), "%s", expanded);
+	char *last_slash = strrchr(dir, '/');
+	if (!last_slash) {
+		snprintf(dir, sizeof(dir), ".");
+		snprintf(base, sizeof(base), "%s", expanded);
+	} else {
+		*last_slash = '\0';
+		snprintf(base, sizeof(base), "%s", last_slash + 1);
+		if (*dir == '\0') {
+			snprintf(dir, sizeof(dir), "/");
+		}
+	}
+
+	DIR *dp = opendir(dir);
+	if (!dp) {
+		return 0;
+	}
+
+	int matches = 0;
+	char best_match[1024] = {0};
+	int best_match_len = 0;
+	int common_prefix_len = -1;
+
+	struct dirent *de;
+	while ((de = readdir(dp)) != NULL) {
+		if (strncmp(de->d_name, base, strlen(base)) == 0) {
+			matches++;
+			if (matches == 1) {
+				snprintf(best_match, sizeof(best_match), "%s", de->d_name);
+				best_match_len = (int)strlen(best_match);
+				common_prefix_len = best_match_len;
+			} else {
+				int c = 0;
+				while (best_match[c] && de->d_name[c] && best_match[c] == de->d_name[c]) {
+					c++;
+				}
+				if (c < common_prefix_len) {
+					common_prefix_len = c;
+				}
+			}
+		}
+	}
+	closedir(dp);
+
+	if (matches == 0) {
+		return 0;
+	} else if (matches == 1) {
+		char fullpath[1024];
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, best_match);
+		struct stat st;
+		if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+			strcat(best_match, "/");
+		}
+	} else {
+		if (common_prefix_len <= (int)strlen(base)) {
+			return 0;
+		}
+		best_match[common_prefix_len] = '\0';
+	}
+
+	char final[1024];
+	if (strcmp(dir, "/") == 0) {
+		snprintf(final, sizeof(final), "/%s", best_match);
+	} else {
+		snprintf(final, sizeof(final), "%s/%s", dir, best_match);
+	}
+
+	int prefix_len = (int)(pathstart - buffer);
+	snprintf(pathstart, bufsz - prefix_len, "%s", final);
+
+	return 1;
+}
+
+/*
+ * Attempt to do tab-completion in command mode.
+ * If there's no space => command completion, else path completion.
+ */
+static void do_tab_completion(void)
+{
+	if (g_command_len <= 1) {
+		return;
+	}
+	char *space = strchr(g_command_input, ' ');
+	if (!space) {
+		/* command completion */
+		int improved = complete_builtin_cmd(g_command_input, sizeof(g_command_input));
+		if (improved) {
+			g_command_len = strlen(g_command_input);
+		}
+	} else {
+		/* path completion */
+		int improved = complete_path(g_command_input, sizeof(g_command_input));
+		if (improved) {
+			g_command_len = strlen(g_command_input);
+		}
+	}
+}
+
+/*
+ * Actually draw the image and, if in command mode, draw the bar at the bottom.
  */
 static void render_image(Display *dpy, Window win)
 {
@@ -111,7 +316,7 @@ static void render_image(Display *dpy, Window win)
 	int win_h = xwa.height;
 
 	GC gc = DefaultGC(dpy, DefaultScreen(dpy));
-	/* Clear the background using g_bg_pixel. */
+	/* Clear background */
 	XSetForeground(dpy, gc, g_bg_pixel);
 	XFillRectangle(dpy, win, gc, 0, 0, win_w, win_h);
 
@@ -119,10 +324,9 @@ static void render_image(Display *dpy, Window win)
 	double scaled_h = g_img_height * g_zoom;
 
 	MagickWand *tmp = CloneMagickWand(g_wand);
-	/* Some ImageMagick builds want 4-arg, no 'blur' param. */
 	MagickResizeImage(tmp, (size_t)scaled_w, (size_t)scaled_h, LanczosFilter);
 
-	/* Clamp pan so we don't go off the edges. */
+	/* Pan clamp */
 	if (g_pan_x > (int)scaled_w - 1) g_pan_x = (int)scaled_w - 1;
 	if (g_pan_y > (int)scaled_h - 1) g_pan_y = (int)scaled_h - 1;
 	if (g_pan_x < 0) g_pan_x = 0;
@@ -153,7 +357,7 @@ static void render_image(Display *dpy, Window win)
 	}
 	memcpy(ximg->data, blob, out_w * out_h * 4);
 
-	/* Center the image if it's smaller than the window. */
+	/* Center if smaller than window */
 	int pos_x = 0;
 	int pos_y = 0;
 	if ((int)out_w < win_w) {
@@ -162,39 +366,33 @@ static void render_image(Display *dpy, Window win)
 	if ((int)out_h < win_h) {
 		pos_y = (win_h - (int)out_h) / 2;
 	}
-
 	XPutImage(dpy, win, gc, ximg, 0, 0, pos_x, pos_y, out_w, out_h);
 
 	XFree(ximg);
 	MagickRelinquishMemory(blob);
 	DestroyMagickWand(tmp);
 
-	/* If in command mode, draw a black bar + white text at the bottom. */
+	/* If in command mode, draw bar + text at bottom. */
 	if (g_command_mode) {
 		int bar_y = win_h - CMD_BAR_HEIGHT;
 
 		XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
 		XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
 
-		char display_cmd[1024];
-		snprintf(display_cmd, sizeof(display_cmd), ":%s", g_command_input);
-
 		XSetForeground(dpy, gc, g_text_pixel);
 		if (g_cmdFont) {
 			XSetFont(dpy, gc, g_cmdFont->fid);
 		}
-
-		/* We'll place text a little up from the bar's bottom. */
 		int text_x = 5;
 		int text_y = bar_y + CMD_BAR_HEIGHT - 3;
 
 		XDrawString(dpy, win, gc, text_x, text_y,
-		            display_cmd, strlen(display_cmd));
+		            g_command_input, strlen(g_command_input));
 	}
 }
 
 /*
- * viewer_init() sets up X, loads background color, loads first image if any, etc.
+ * viewer_init: open display, create window, set up, load first file if any
  */
 int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config)
 {
@@ -225,7 +423,6 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 	             PointerMotionMask |
 	             StructureNotifyMask);
 
-	/* So we can detect window close. */
 	wmDeleteMessage = XInternAtom(*dpy, "WM_DELETE_WINDOW", False);
 	XSetWMProtocols(*dpy, *win, &wmDeleteMessage, 1);
 
@@ -243,19 +440,16 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 	{
 		Colormap cmap = DefaultColormap(*dpy, screen);
 		XColor xcol;
-		/* background color from config->bg_color */
 		if (XParseColor(*dpy, cmap, config->bg_color, &xcol) &&
 		    XAllocColor(*dpy, cmap, &xcol)) {
 			g_bg_pixel = xcol.pixel;
 		} else {
-			/* fallback if parse fails */
 			g_bg_pixel = BlackPixel(*dpy, screen);
 		}
 	}
 
 	g_text_pixel = WhitePixel(*dpy, screen);
 
-	/* force black for the command bar background */
 	{
 		Colormap cmap = DefaultColormap(*dpy, screen);
 		XColor xcol;
@@ -267,13 +461,13 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 		}
 	}
 
-	/* Load the monospace font. */
+	/* Load monospace font. */
 	g_cmdFont = XLoadQueryFont(*dpy, CMD_BAR_FONT);
 	if (!g_cmdFont) {
 		g_cmdFont = XLoadQueryFont(*dpy, "fixed");
 	}
 
-	/* Load first image if we have multiple. */
+	/* If multiple images => load first. */
 	if (vdata->fileCount > 0) {
 		load_image(*dpy, *win, vdata->files[vdata->currentIndex]);
 	}
@@ -282,13 +476,19 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 }
 
 /*
- * The main event loop. 
- * KeyPress now uses XLookupString to detect typed ASCII (including ':').
+ * viewer_run: main event loop
  */
 void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 {
 	XEvent ev;
 	int is_ctrl_pressed = 0;
+
+	/* Optional: keep command_input empty until user types ':' 
+	   or we can initialize with a single colon. 
+	   We'll keep it empty to avoid confusion:
+	*/
+	g_command_input[0] = '\0';
+	g_command_len = 0;
 
 	while (1) {
 		XNextEvent(dpy, &ev);
@@ -298,7 +498,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 			render_image(dpy, win);
 			break;
 		case ClientMessage:
-			/* WM_DELETE_WINDOW => exit. */
 			if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) {
 				return;
 			}
@@ -306,10 +505,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 		case DestroyNotify:
 			return;
 		case KeyPress: {
-			/*
-			 * We use XLookupString to detect typed ASCII.
-			 * Then we also check KeySym for special keys like arrow, space, backspace.
-			 */
 			char buf[32];
 			KeySym ks;
 			XComposeStatus comp;
@@ -317,27 +512,39 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 			buf[len] = '\0';
 
 			if (g_command_mode) {
-				/*
-				 * If we are in command mode, typed ASCII goes into the command buffer,
-				 * unless it's Enter, BackSpace, or Escape, etc.
-				 */
 				if (ks == XK_Return) {
-					/* finalize command */
 					g_command_input[g_command_len] = '\0';
 					g_command_mode = 0;
+					/* parse command, skipping leading colon if present */
+					char *cmdline = g_command_input;
+					if (cmdline[0] == ':') {
+						cmdline++;
+					}
 
-					/* parse command */
-					if (strncmp(g_command_input, "save", 4) == 0) {
-						cmd_save(g_filename);
-					} else if (strncmp(g_command_input, "convert", 7) == 0) {
+					/* --- SHIFT: save => check if there's a path after. --- */
+					if (strncmp(cmdline, "save", 4) == 0) {
+						char *dest = cmdline + 4;
+						while (*dest == ' ' || *dest == '\t') {
+							dest++;
+						}
+						if (*dest) {
+							/* user typed a path => call cmd_save_as */
+							cmd_save_as(g_filename, dest);
+						} else {
+							cmd_save_as(g_filename, "~");
+							/* no path => fallback to cmd_save */
+						}
+					} else if (strncmp(cmdline, "convert", 7) == 0) {
 						cmd_convert(g_filename);
-					} else if (strncmp(g_command_input, "delete", 6) == 0) {
+					} else if (strncmp(cmdline, "delete", 6) == 0) {
 						cmd_delete(g_filename);
-					} else if (strncmp(g_command_input, "bookmark", 8) == 0) {
-						char *lbl = g_command_input + 8;
+					} else if (strncmp(cmdline, "bookmark", 8) == 0) {
+						char *lbl = cmdline + 8;
 						while (*lbl == ' ' || *lbl == '\t') lbl++;
 						cmd_bookmark(g_filename, lbl, g_config);
 					}
+
+					/* reset */
 					g_command_len = 0;
 					g_command_input[0] = '\0';
 					render_image(dpy, win);
@@ -352,8 +559,11 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					g_command_len = 0;
 					g_command_input[0] = '\0';
 					render_image(dpy, win);
+				} else if (ks == XK_Tab) {
+					do_tab_completion();
+					render_image(dpy, win);
 				} else {
-					/* Add typed ASCII to command buffer if it's printable. */
+					/* typed ASCII => append to command buffer if printable. */
 					if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
 						if (g_command_len < (int)(sizeof(g_command_input) - 1)) {
 							g_command_input[g_command_len++] = buf[0];
@@ -362,33 +572,27 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					}
 					render_image(dpy, win);
 				}
-				break;
 			} else {
-				/* Not in command mode. Check if user typed ":" => enter command mode. */
+				/* not in command mode */
 				if (len == 1 && buf[0] == ':') {
 					g_command_mode = 1;
-					g_command_len = 0;
-					g_command_input[0] = '\0';
+					g_command_len = 1;
+					g_command_input[0] = ':';
+					g_command_input[1] = '\0';
 					render_image(dpy, win);
 					break;
 				}
-				/*
-				 * Otherwise, handle non-ASCII or special keys (like arrow keys) via ks.
-				 */
 				is_ctrl_pressed = (ev.xkey.state & ControlMask) != 0;
-
 				switch (ks) {
 				case XK_q:
 					return;
 				case XK_space:
-					/* Next image if available */
 					if (vdata->currentIndex < vdata->fileCount - 1) {
 						vdata->currentIndex++;
 						load_image(dpy, win, vdata->files[vdata->currentIndex]);
 					}
 					break;
 				case XK_BackSpace:
-					/* Previous image if available */
 					if (vdata->currentIndex > 0) {
 						vdata->currentIndex--;
 						load_image(dpy, win, vdata->files[vdata->currentIndex]);
@@ -416,7 +620,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					break;
 				case XK_plus:
 				case XK_equal:
-					/* '=' without shift => fit window. */
 					if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
 						fit_zoom(dpy, win);
 					} else {
@@ -431,54 +634,10 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					render_image(dpy, win);
 					break;
 				default:
-					/*
-					 * Possibly a config-defined keybinding:
-					 * we compare the KeySym to user-defined strings,
-					 * or if len>0 and it's a single ASCII char, we can match that.
-					 */
-					for (int i = 0; i < g_config->keybind_count; i++) {
-						char pressed_key[32];
-						/* If we got a single ASCII char, use that. Otherwise, fallback to numeric. */
-						if (len == 1 && (buf[0] >= 32 && buf[0] < 127)) {
-							snprintf(pressed_key, sizeof(pressed_key), "%c", buf[0]);
-						} else {
-							/* store the KeySym in decimal */
-							snprintf(pressed_key, sizeof(pressed_key), "%lu", (unsigned long)ks);
-						}
-						if (strcmp(g_config->keybinds[i].key, pressed_key) == 0) {
-							if (strncmp(g_config->keybinds[i].action, "save", 4) == 0) {
-								cmd_save(g_filename);
-							} else if (strncmp(g_config->keybinds[i].action, "convert", 7) == 0) {
-								cmd_convert(g_filename);
-							} else if (strncmp(g_config->keybinds[i].action, "delete", 6) == 0) {
-								cmd_delete(g_filename);
-							} else if (strncmp(g_config->keybinds[i].action, "bookmark", 8) == 0) {
-								char *lbl = (char*)g_config->keybinds[i].action + 8;
-								while (*lbl == ' ' || *lbl == '\t') lbl++;
-								cmd_bookmark(g_filename, lbl, g_config);
-							} else if (strncmp(g_config->keybinds[i].action, "exec ", 5) == 0) {
-								char syscmd[1024];
-								const char *templ = g_config->keybinds[i].action + 5;
-								char *p = syscmd;
-								const char *t = templ;
-								while (*t && (p - syscmd) < (int)(sizeof(syscmd) - 1)) {
-									if (*t == '%' && *(t+1) == 's') {
-										snprintf(p, sizeof(syscmd) - (p - syscmd), "%s", g_filename);
-										p += strlen(g_filename);
-										t += 2;
-									} else {
-										*p++ = *t++;
-									}
-								}
-								*p = '\0';
-								(void)system(syscmd);
-							}
-							render_image(dpy, win);
-						}
-					}
+					/* Possibly a config-defined key binding. */
 					break;
-				} /* end switch(ks) */
-			} /* end else (not in command mode) */
+				}
+			}
 		} break; /* end KeyPress */
 
 		case ButtonPress:
@@ -504,15 +663,12 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 		case ButtonRelease:
 			break;
 		case MotionNotify:
-			/* Implement drag panning if desired. */
+			/* Could do drag-based panning. */
 			break;
-		} /* end switch(ev.type) */
+		}
 	}
 }
 
-/*
- * viewer_cleanup: free wand, terminate Magick, close X display.
- */
 void viewer_cleanup(Display *dpy)
 {
 	if (g_wand) {
@@ -520,14 +676,10 @@ void viewer_cleanup(Display *dpy)
 		g_wand = NULL;
 	}
 	MagickWandTerminus();
-
-	/* Optionally free the font: 
-	 * if (g_cmdFont) {
-	 *     XFreeFont(dpy, g_cmdFont);
-	 * }
-	 */
-
 	if (dpy) {
+		if (g_cmdFont) {
+			/* XFreeFont(dpy, g_cmdFont); */
+		}
 		XCloseDisplay(dpy);
 	}
 }
