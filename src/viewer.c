@@ -535,7 +535,11 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 							/* no path => fallback to cmd_save */
 						}
 					} else if (strncmp(cmdline, "convert", 7) == 0) {
-						cmd_convert(g_filename);
+						char *dest = cmdline + 7;
+						while (*dest == ' ' || *dest == '\t') {
+							dest++;
+						}
+						cmd_convert(g_filename, dest);
 					} else if (strncmp(cmdline, "delete", 6) == 0) {
 						cmd_delete(g_filename);
 					} else if (strncmp(cmdline, "bookmark", 8) == 0) {
