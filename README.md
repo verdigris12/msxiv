@@ -1,6 +1,9 @@
 # msxiv
 
-`msxiv` is a lightweight, Zathura-like image viewer inspired by `sxiv`, using **ImageMagick** as a backend. It supports **asynchronous panning**, **smooth zooming**, and a **gallery mode** for browsing multiple images efficiently. It uses **X11** for rendering and follows the **suckless** design philosophy.
+`msxiv` is a lightweight, Zathura-like image viewer inspired by `sxiv`, using **ImageMagick** as a backend.
+It should support all formats that imagemagick `display` supports.
+
+*I generated most of the codebase with o1. Use with caution. Hillarity may ensue.*
 
 ## Building
 
