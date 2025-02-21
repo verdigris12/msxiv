@@ -24,6 +24,9 @@ typedef struct {
 
 	int bookmark_count;
 	BookmarkEntry bookmarks[MAX_BOOKMARKS];
+
+	/* NEW: background color field, e.g. "#000000", "white", etc. */
+	char bg_color[32];
 } MsxivConfig;
 
 /* Parse the TOML config file at ~/.config/msxiv/config.toml.
