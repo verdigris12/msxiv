@@ -386,78 +386,97 @@ static void render_gallery(Display *dpy, Window win, ViewerData *vdata)
 
 static void render_image(Display *dpy, Window win)
 {
-	if (!g_scaled_ximg) {
-		/* no image => do nothing. */
-		return;
-	}
+    if (!g_scaled_ximg) {
+        return;
+    }
 
-	XWindowAttributes xwa;
-	XGetWindowAttributes(dpy, win, &xwa);
-	int win_w = xwa.width;
-	int win_h = xwa.height;
+    XWindowAttributes xwa;
+    XGetWindowAttributes(dpy, win, &xwa);
+    int win_w = xwa.width;
+    int win_h = xwa.height;
 
-	GC gc = DefaultGC(dpy, DefaultScreen(dpy));
+    GC gc = DefaultGC(dpy, DefaultScreen(dpy));
 
-	/* Clear background. */
-	XSetForeground(dpy, gc, g_bg_pixel);
-	XFillRectangle(dpy, win, gc, 0, 0, win_w, win_h);
+    /* Clear background */
+    XSetForeground(dpy, gc, g_bg_pixel);
+    XFillRectangle(dpy, win, gc, 0, 0, win_w, win_h);
 
-	/* Only allow panning if scaled image dimension > window dimension. */
-	if (g_scaled_w <= win_w) {
-		g_pan_x = 0;
-	} else {
-		if (g_pan_x > g_scaled_w - 1) g_pan_x = g_scaled_w - 1;
-		if (g_pan_x < 0)             g_pan_x = 0;
-	}
-	if (g_scaled_h <= win_h) {
-		g_pan_y = 0;
-	} else {
-		if (g_pan_y > g_scaled_h - 1) g_pan_y = g_scaled_h - 1;
-		if (g_pan_y < 0)             g_pan_y = 0;
-	}
+    /*
+     * Determine the portion of the scaled image we can show:
+     * copy_w = how many pixels we’ll copy horizontally,
+     * copy_h = how many pixels we’ll copy vertically.
+     */
+    int copy_w = (g_scaled_w < win_w) ? g_scaled_w : win_w;
+    int copy_h = (g_scaled_h < win_h) ? g_scaled_h : win_h;
 
-	int copy_w = (win_w > g_scaled_w) ? g_scaled_w : win_w;
-	int copy_h = (win_h > g_scaled_h) ? g_scaled_h : win_h;
+    /*
+     * Now clamp g_pan_x, g_pan_y so we can’t pan outside the valid range.
+     * The maximum valid pan_x is (g_scaled_w - copy_w).
+     * The maximum valid pan_y is (g_scaled_h - copy_h).
+     */
+    if (g_scaled_w <= win_w) {
+        /* No horizontal panning if image is narrower than window */
+        g_pan_x = 0;
+    } else {
+        if (g_pan_x < 0) {
+            g_pan_x = 0;
+        } else if (g_pan_x > g_scaled_w - copy_w) {
+            g_pan_x = g_scaled_w - copy_w;
+        }
+    }
 
-	/* Center if scaled < window dimension. */
-	int dx = 0;
-	int dy = 0;
-	if (g_scaled_w < win_w) {
-		dx = (win_w - g_scaled_w) / 2;
-	}
-	if (g_scaled_h < win_h) {
-		dy = (win_h - g_scaled_h) / 2;
-	}
+    if (g_scaled_h <= win_h) {
+        /* No vertical panning if image is shorter than window */
+        g_pan_y = 0;
+    } else {
+        if (g_pan_y < 0) {
+            g_pan_y = 0;
+        } else if (g_pan_y > g_scaled_h - copy_h) {
+            g_pan_y = g_scaled_h - copy_h;
+        }
+    }
 
-	XImage subimg;
-	memcpy(&subimg, g_scaled_ximg, sizeof(XImage));
-	subimg.width  = copy_w;
-	subimg.height = copy_h;
-	int rowbytes  = g_scaled_ximg->bytes_per_line;
-	unsigned char *base_ptr = (unsigned char*)g_scaled_ximg->data;
-	unsigned char *sub_ptr  = base_ptr + (g_pan_y * rowbytes) + (g_pan_x * 4);
-	subimg.data   = (char*)sub_ptr;
+    /*
+     * Center if the scaled image is smaller than the window dimension.
+     * dx, dy is where we put the subregion in the window.
+     */
+    int dx = 0;
+    int dy = 0;
+    if (g_scaled_w < win_w) {
+        dx = (win_w - g_scaled_w) / 2;
+    }
+    if (g_scaled_h < win_h) {
+        dy = (win_h - g_scaled_h) / 2;
+    }
 
-	XPutImage(dpy, win, gc, &subimg,
-	          0, 0,
-	          dx, dy,
-	          copy_w, copy_h);
+    /* Build a temporary sub-XImage pointing into g_scaled_ximg’s data. */
+    XImage sub_ximg;
+    memcpy(&sub_ximg, g_scaled_ximg, sizeof(XImage));
+    sub_ximg.width  = copy_w;
+    sub_ximg.height = copy_h;
 
-	/* If in command mode, draw a bar at bottom. */
-	if (g_command_mode) {
-		int bar_y = win_h - CMD_BAR_HEIGHT;
-		XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
-		XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
+    int rowbytes = g_scaled_ximg->bytes_per_line;
+    unsigned char *base_ptr = (unsigned char*)g_scaled_ximg->data;
+    unsigned char *sub_ptr  = base_ptr + (g_pan_y * rowbytes) + (g_pan_x * 4);
+    sub_ximg.data           = (char*)sub_ptr;
 
-		XSetForeground(dpy, gc, g_text_pixel);
-		if (g_cmdFont) {
-			XSetFont(dpy, gc, g_cmdFont->fid);
-		}
-		int text_x = 5;
-		int text_y = bar_y + CMD_BAR_HEIGHT - 3;
-		XDrawString(dpy, win, gc, text_x, text_y,
-		            g_command_input, strlen(g_command_input));
-	}
+    /* Copy the subregion onto the window at (dx, dy). */
+    XPutImage(dpy, win, gc, &sub_ximg, 0, 0, dx, dy, copy_w, copy_h);
+
+    /* If in command mode, draw the command bar. */
+    if (g_command_mode) {
+        int bar_y = win_h - CMD_BAR_HEIGHT;
+        XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
+        XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
+
+        XSetForeground(dpy, gc, g_text_pixel);
+        if (g_cmdFont) {
+            XSetFont(dpy, gc, g_cmdFont->fid);
+        }
+        int text_x = 5;
+        int text_y = bar_y + CMD_BAR_HEIGHT - 3;
+        XDrawString(dpy, win, gc, text_x, text_y, g_command_input, strlen(g_command_input));
+    }
 }
 
 /* =========================
