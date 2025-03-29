@@ -29,8 +29,6 @@
           pkgs.xorg.libXext
         ];
 
-        # Optionally, if you want special cmake flags:
-        cmakeFlags = [ "-DCMAKE_INSTALL_PREFIX=$out" ];
       };
     };
   };
