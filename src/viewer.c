@@ -48,19 +48,29 @@ static int g_gallery_mode = 0;
 static XImage     *g_scaled_ximg = NULL;
 static int         g_scaled_w     = 0;
 static int         g_scaled_h     = 0;
-static MagickWand *g_wand        = NULL;
-static int         g_img_width   = 0;
-static int         g_img_height  = 0;
-static double      g_zoom        = 1.0;
-static int         g_pan_x       = 0;
-static int         g_pan_y       = 0;
+static MagickWand *g_wand         = NULL;
+static int         g_img_width    = 0;
+static int         g_img_height   = 0;
+static double      g_zoom         = 1.0;
+static int         g_pan_x        = 0;
+static int         g_pan_y        = 0;
 
-static char        g_filename[1024] = {0};
-static MsxivConfig *g_config        = NULL;
+static char g_filename[1024] = {0};
+static MsxivConfig *g_config = NULL;
 
+/* Command bar input. If g_command_mode=1, we show typed commands. */
 static char g_command_input[1024] = {0};
 static int  g_command_mode        = 0;
 static int  g_command_len         = 0;
+
+/*
+ * We also want to show either (a) the file path or (b) the last command result
+ * in normal mode. We'll store that result here, and a small flag telling us
+ * if we are currently showing the last command's message.
+ */
+static char g_last_cmd_result[1024] = {0};
+/* g_status_mode=0 => show g_filename, g_status_mode=1 => show g_last_cmd_result */
+static int g_status_mode = 0;
 
 static unsigned long g_bg_pixel         = 0;
 static unsigned long g_text_pixel       = 0;
@@ -68,7 +78,7 @@ static unsigned long g_cmdbar_bg_pixel  = 0;
 static unsigned long g_gallery_bg_pixel = 0;
 
 static XFontStruct *g_cmdFont = NULL;
-static Atom         wmDeleteMessage;
+static Atom wmDeleteMessage;
 
 /* Thumbnails for gallery mode */
 typedef struct {
@@ -78,18 +88,25 @@ typedef struct {
 } GalleryThumb;
 
 static GalleryThumb *g_thumbs         = NULL;
-static int           g_gallery_select = 0;
+static int g_gallery_select           = 0;
+
+/*
+ * =========================
+ * FORWARD DECLARATIONS
+ * =========================
+ */
+static void free_scaled_ximg(void);
+static void generate_scaled_ximg(Display *dpy);
+static void render_image(Display *dpy, Window win);
+static void fit_zoom(Display *dpy, Window win);
+static void load_image(Display *dpy, Window win, const char *filename);
+static void free_gallery_thumbnails(int fileCount);
 
 /*
  * ============================================================
- * Minimal tab-completion logic (unchanged from previous):
- *  - Commands: "save", "save_as", "convert", "delete", "bookmark".
- *  - Path completion with ~, ., ..
- *  - If multiple matches => fill largest common prefix
- *  - If exactly one => fill fully + space
+ * Minimal tab-completion logic for commands + path completion
  * ============================================================
  */
-
 static const char *g_known_cmds[] = {
 	"save",
 	"save_as",
@@ -180,7 +197,6 @@ static int gather_path_matches(const char *directory, const char *leaf,
 	int count = 0;
 	struct dirent *de;
 	while ((de = readdir(dirp)) != NULL) {
-		/* skip unless matches prefix */
 		if (strncmp(de->d_name, leaf, strlen(leaf)) == 0) {
 			if (count < max_list) {
 				list[count] = strdup(de->d_name);
@@ -240,7 +256,7 @@ static void try_tab_completion(void)
 			char prefixbuf[256];
 			char *tmp_list[32];
 			for (int i = 0; i < match_count; i++) {
-				tmp_list[i] = (char*)matches[i];
+				tmp_list[i] = (char *)matches[i];
 			}
 			find_largest_common_prefix(tmp_list, match_count,
 			                           prefixbuf, sizeof(prefixbuf));
@@ -253,7 +269,7 @@ static void try_tab_completion(void)
 			}
 		}
 	} else {
-		/* Path completion */
+		/* Path completion after command */
 		char command[64];
 		size_t len = space - (g_command_input + 1);
 		if (len >= sizeof(command)) len = sizeof(command) - 1;
@@ -318,20 +334,7 @@ static void try_tab_completion(void)
 
 /*
  * =========================
- * FORWARD DECLARATIONS
- * =========================
- */
-
-static void free_scaled_ximg(void);
-static void generate_scaled_ximg(Display *dpy);
-static void render_image(Display *dpy, Window win);
-static void fit_zoom(Display *dpy, Window win);
-static void load_image(Display *dpy, Window win, const char *filename);
-static void free_gallery_thumbnails(int fileCount);
-
-/*
- * =========================
- * THUMBNAIL GALLERY
+ * GALLERY THUMBNAILS
  * =========================
  */
 
@@ -535,9 +538,12 @@ static void load_image(Display *dpy, Window win, const char *filename)
 
 	g_wand = NewMagickWand();
 	if (MagickReadImage(g_wand, filename) == MagickFalse) {
+		/* Should not happen if we filtered out invalid files in main.c,
+		 * but we handle just in case. */
 		fprintf(stderr, "Failed to read image: %s\n", filename);
 		DestroyMagickWand(g_wand);
 		g_wand = NULL;
+		g_filename[0] = '\0';
 		return;
 	}
 
@@ -552,12 +558,44 @@ static void load_image(Display *dpy, Window win, const char *filename)
 	g_pan_x = 0;
 	g_pan_y = 0;
 
+	/* If we are currently showing the path in the status bar,
+	 * let's update it to the new file. (Only if g_status_mode==0) */
+	if (g_status_mode == 0) {
+		/* The path is automatically read from g_filename in render_image() */
+	}
+
 	fit_zoom(dpy, win);
 }
 
 static void render_image(Display *dpy, Window win)
 {
-	if (!g_scaled_ximg) return;
+	if (!g_scaled_ximg) {
+		/* Possibly no image loaded or load failed */
+		XWindowAttributes xwa;
+		XGetWindowAttributes(dpy, win, &xwa);
+		GC gc = DefaultGC(dpy, DefaultScreen(dpy));
+		XSetForeground(dpy, gc, g_bg_pixel);
+		XFillRectangle(dpy, win, gc, 0, 0, xwa.width, xwa.height);
+		/* Show at least the command/status bar if needed */
+		if (g_command_mode || g_status_mode == 1 || g_filename[0]) {
+			int bar_y = xwa.height - CMD_BAR_HEIGHT;
+			XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
+			XFillRectangle(dpy, win, gc, 0, bar_y, xwa.width, CMD_BAR_HEIGHT);
+			XSetForeground(dpy, gc, g_text_pixel);
+			if (g_cmdFont) XSetFont(dpy, gc, g_cmdFont->fid);
+
+			if (g_command_mode) {
+				XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3,
+				            g_command_input, strlen(g_command_input));
+			} else {
+				/* Show last cmd result or path if we have any */
+				const char *text = (g_status_mode == 1) ? g_last_cmd_result : g_filename;
+				XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3,
+				            text, strlen(text));
+			}
+		}
+		return;
+	}
 
 	XWindowAttributes xwa;
 	XGetWindowAttributes(dpy, win, &xwa);
@@ -607,42 +645,47 @@ static void render_image(Display *dpy, Window win)
 	sub_ximg.height = copy_h;
 
 	int rowbytes = g_scaled_ximg->bytes_per_line;
-	unsigned char *base_ptr = (unsigned char*)g_scaled_ximg->data;
+	unsigned char *base_ptr = (unsigned char *)g_scaled_ximg->data;
 	unsigned char *sub_ptr  = base_ptr + (g_pan_y * rowbytes) + (g_pan_x * 4);
-	sub_ximg.data           = (char*)sub_ptr;
+	sub_ximg.data           = (char *)sub_ptr;
 
 	XPutImage(dpy, win, gc, &sub_ximg, 0, 0, dx, dy, copy_w, copy_h);
 
-	/* Draw command bar if in command mode. */
-	if (g_command_mode) {
-		int bar_y = win_h - CMD_BAR_HEIGHT;
-		XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
-		XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
+	/* Draw command/status bar */
+	int bar_y = win_h - CMD_BAR_HEIGHT;
+	XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
+	XFillRectangle(dpy, win, gc, 0, bar_y, win_w, CMD_BAR_HEIGHT);
 
-		XSetForeground(dpy, gc, g_text_pixel);
-		if (g_cmdFont) {
-			XSetFont(dpy, gc, g_cmdFont->fid);
-		}
+	XSetForeground(dpy, gc, g_text_pixel);
+	if (g_cmdFont) {
+		XSetFont(dpy, gc, g_cmdFont->fid);
+	}
+
+	if (g_command_mode) {
+		/* Show typed command */
 		XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3,
 		            g_command_input, strlen(g_command_input));
+	} else {
+		/* Show last command result if we have it, or the file path */
+		if (g_status_mode == 1) {
+			XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3,
+			            g_last_cmd_result, strlen(g_last_cmd_result));
+		} else {
+			XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3,
+			            g_filename, strlen(g_filename));
+		}
 	}
 }
 
 /*
  * ==================================================
- * Minimal Command-Line Parser & Executor
+ * Minimal Command Executor
  * ==================================================
- * When user presses Enter in command mode, we parse:
- *   :<command> <args...>
- * And call the relevant function from commands.h
  */
-
 static void execute_command_line(void)
 {
-	/* g_command_input e.g. ":convert ~/1.jpg" */
 	if (g_command_input[0] != ':') return;
 
-	/* skip the ':' and parse out the first token (the command) */
 	char line[1024];
 	strncpy(line, g_command_input + 1, sizeof(line));
 	line[sizeof(line) - 1] = '\0';
@@ -651,55 +694,49 @@ static void execute_command_line(void)
 	if (!cmd) {
 		return;
 	}
-
-	/* The rest is arguments */
 	char *args = strtok(NULL, "");
 	if (!args) {
-		args = (char*)""; /* no arguments typed */
+		args = (char *)"";
 	}
 
+	/* We store the command result here: */
+	char msgbuf[1024];
+	msgbuf[0] = '\0';
+
+	int ret = -1;
+
 	if (!strcmp(cmd, "convert")) {
-		/* usage: :convert <destination> 
-		 * calls cmd_convert(g_filename, <destination>)
-		 */
 		if (*args) {
-			cmd_convert(g_filename, args);
+			ret = cmd_convert(g_filename, args, msgbuf, sizeof(msgbuf));
 		} else {
-			fprintf(stderr, "[msxiv] :convert requires a destination\n");
+			snprintf(msgbuf, sizeof(msgbuf), "Error: :convert requires a destination");
 		}
-
 	} else if (!strcmp(cmd, "save")) {
-		/* usage: :save 
-		 * calls cmd_save(g_filename)
-		 */
-		cmd_save(g_filename);
-
+		ret = cmd_save(g_filename, msgbuf, sizeof(msgbuf));
 	} else if (!strcmp(cmd, "save_as")) {
-		/* usage: :save_as <dest> */
 		if (*args) {
-			cmd_save_as(g_filename, args);
+			ret = cmd_save_as(g_filename, args, msgbuf, sizeof(msgbuf));
 		} else {
-			fprintf(stderr, "[msxiv] :save_as requires a destination\n");
+			snprintf(msgbuf, sizeof(msgbuf), "Error: :save_as requires a destination");
 		}
-
 	} else if (!strcmp(cmd, "delete")) {
-		/* usage: :delete 
-		 * calls cmd_delete(g_filename)
-		 */
-		cmd_delete(g_filename);
-
+		ret = cmd_delete(g_filename, msgbuf, sizeof(msgbuf));
 	} else if (!strcmp(cmd, "bookmark")) {
-		/* usage: :bookmark <label> 
-		 * calls cmd_bookmark(g_filename, label, g_config)
-		 */
 		if (*args) {
-			cmd_bookmark(g_filename, args, g_config);
+			ret = cmd_bookmark(g_filename, args, g_config, msgbuf, sizeof(msgbuf));
 		} else {
-			fprintf(stderr, "[msxiv] :bookmark requires a label\n");
+			snprintf(msgbuf, sizeof(msgbuf), "Error: :bookmark requires a label");
 		}
-
 	} else {
-		fprintf(stderr, "[msxiv] Unknown command: %s\n", cmd);
+		snprintf(msgbuf, sizeof(msgbuf), "Unknown command: %s", cmd);
+	}
+
+	/* If command created any message, store it in g_last_cmd_result. */
+	if (msgbuf[0]) {
+		strncpy(g_last_cmd_result, msgbuf, sizeof(g_last_cmd_result));
+		g_last_cmd_result[sizeof(g_last_cmd_result) - 1] = '\0';
+		/* Show the last command result in normal mode until ESC is pressed */
+		g_status_mode = 1;
 	}
 }
 
@@ -711,13 +748,19 @@ static void execute_command_line(void)
 
 int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config)
 {
-	MagickWandGenesis();
-
+	/* We assume MagickWandGenesis() was already called in main.c */
 	g_config = config;
 	g_wand   = NULL;
 	g_gallery_mode = 0;
 	g_thumbs = NULL;
 	g_gallery_select = 0;
+
+	*g_command_input = '\0';
+	g_command_len = 0;
+	g_command_mode = 0;
+
+	*g_last_cmd_result = '\0';
+	g_status_mode = 0; /* show path by default */
 
 	*dpy = XOpenDisplay(NULL);
 	if (!*dpy) {
@@ -755,6 +798,7 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 		g_cmdFont = XLoadQueryFont(*dpy, "fixed");
 	}
 
+	/* Background color from config->bg_color */
 	{
 		Colormap cmap = DefaultColormap(*dpy, screen);
 		XColor xcol;
@@ -790,9 +834,12 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
 		}
 	}
 
+	/* If multiple files, generate gallery thumbs. */
 	if (vdata->fileCount > 1) {
 		generate_gallery_thumbnails(*dpy, vdata->fileCount, vdata->files);
 	}
+
+	/* Load first file */
 	if (vdata->fileCount > 0) {
 		load_image(*dpy, *win, vdata->files[vdata->currentIndex]);
 	}
@@ -804,10 +851,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 {
 	XEvent ev;
 	int is_ctrl_pressed = 0;
-
-	g_command_input[0] = '\0';
-	g_command_len = 0;
-	g_gallery_mode = 0;
 
 	while (1) {
 		XNextEvent(dpy, &ev);
@@ -842,7 +885,7 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 			buf[len] = '\0';
 
 			if (g_gallery_mode) {
-				/* GALLERY MODE NAVIGATION */
+				/* GALLERY MODE */
 				switch (ks) {
 				case XK_q:
 					return;
@@ -852,11 +895,12 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					break;
 				case XK_Return:
 				case XK_KP_Enter:
-					if (g_gallery_select >= 0 && g_gallery_select < vdata->fileCount) {
+					if (g_gallery_select >= 0 &&
+					    g_gallery_select < vdata->fileCount) {
 						vdata->currentIndex = g_gallery_select;
 						g_gallery_mode = 0;
 						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-					  render_image(dpy, win);
+						render_image(dpy, win);
 					}
 					break;
 				case XK_Left:
@@ -890,12 +934,10 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 			} else if (g_command_mode) {
 				/* COMMAND MODE */
 				if (ks == XK_Return) {
+					/* finalize command and run it */
 					g_command_input[g_command_len] = '\0';
 					g_command_mode = 0;
-
-					/* Parse & execute the typed command. */
 					execute_command_line();
-
 					g_command_len = 0;
 					g_command_input[0] = '\0';
 					render_image(dpy, win);
@@ -906,6 +948,7 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					}
 					render_image(dpy, win);
 				} else if (ks == XK_Escape) {
+					/* Cancel command mode, revert to normal mode */
 					g_command_mode = 0;
 					g_command_len  = 0;
 					g_command_input[0] = '\0';
@@ -927,6 +970,7 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 				is_ctrl_pressed = ((ev.xkey.state & ControlMask) != 0);
 
 				if (len == 1 && buf[0] == ':') {
+					/* Enter command mode */
 					g_command_mode = 1;
 					g_command_len  = 1;
 					g_command_input[0] = ':';
@@ -942,14 +986,14 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					if (vdata->currentIndex < vdata->fileCount - 1) {
 						vdata->currentIndex++;
 						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-					  render_image(dpy, win);
+						render_image(dpy, win);
 					}
 					break;
 				case XK_BackSpace:
 					if (vdata->currentIndex > 0) {
 						vdata->currentIndex--;
 						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-					  render_image(dpy, win);
+						render_image(dpy, win);
 					}
 					break;
 				case XK_Return:
@@ -1000,6 +1044,11 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 					generate_scaled_ximg(dpy);
 					render_image(dpy, win);
 					break;
+				case XK_Escape:
+					/* If user hits ESC in normal mode, we show file path again */
+					g_status_mode = 0;
+					render_image(dpy, win);
+					break;
 				default:
 					break;
 				}
@@ -1032,7 +1081,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 			break;
 
 		case MotionNotify:
-			/* Could implement drag-based panning if desired. */
 			break;
 		}
 	}
@@ -1041,19 +1089,18 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 void viewer_cleanup(Display *dpy)
 {
 	free_scaled_ximg();
-	/*
-	 * If we had vdata->fileCount, we could do:
-	 *   free_gallery_thumbnails(vdata->fileCount);
-	 */
+	/* Also free gallery thumbs if we had any */
+	/* We don't have direct access to vdata->fileCount here, but if we did: */
+	/* free_gallery_thumbnails(vdata->fileCount); */
+
 	if (g_wand) {
 		DestroyMagickWand(g_wand);
 		g_wand = NULL;
 	}
-	MagickWandTerminus();
 
 	if (dpy) {
 		if (g_cmdFont) {
-			/* XFreeFont(dpy, g_cmdFont); */
+			/* Typically: XFreeFont(dpy, g_cmdFont); */
 		}
 		XCloseDisplay(dpy);
 	}
