@@ -2,7 +2,6 @@
   description = "A flake for building msxiv";
 
   inputs = {
-    # nixpkgs.url = "github:NixOS/nixpkgs";
     nixpkgs.url = "github:NixOS/nixpkgs/e2605d0744c2417b09f8bf850dfca42fcf537d34";
   };
 
@@ -12,29 +11,27 @@
     pkgs = import nixpkgs { inherit system; };
   in
   {
-    packages.x86_64-linux.default = pkgs.stdenv.mkDerivation {
-      pname = "msxiv";
-      version = "1.0.0";
-      src = ./.;
+    packages.${system} = {
+      msxiv = pkgs.stdenv.mkDerivation {
+        pname = "msxiv";
+        version = "0.1";
+        src = ./.;
 
-      nativeBuildInputs = [
-        pkgs.cmake
-        pkgs.pkgconf
-        pkgs.imagemagick
-        pkgs.xorg.libX11
-      ];
+        nativeBuildInputs = [
+          pkgs.cmake
+          pkgs.pkg-config
+        ];
 
-      buildPhase = ''
-        mkdir -p build
-        cd build
-        cmake .. -DCMAKE_INSTALL_PREFIX=$out
-        make
-      '';
+        buildInputs = [
+          pkgs.imagemagick
+          pkgs.xorg.libX11
+          pkgs.xorg.libXft
+          pkgs.xorg.libXext
+        ];
 
-      installPhase = ''
-        cd build
-        make install
-      '';
+        # Optionally, if you want special cmake flags:
+        cmakeFlags = [ "-DCMAKE_INSTALL_PREFIX=$out" ];
+      };
     };
   };
 }

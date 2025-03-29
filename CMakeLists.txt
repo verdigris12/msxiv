@@ -32,3 +32,5 @@ target_link_libraries(msxiv
     ${X11_LIBRARIES}
     ${IMAGEMAGICK_LIBRARIES}
 )
+
+install(TARGETS msxiv RUNTIME DESTINATION bin)
