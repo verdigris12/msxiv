@@ -30,7 +30,7 @@
 #define GALLERY_OFFSET_X  20
 #define GALLERY_OFFSET_Y  20
 
-#define GALLERY_BG_COLOR  "#333333"
+#define GALLERY_BG_COLOR  "#000000"
 
 #define ZOOM_STEP 0.1
 #define MIN_ZOOM  0.1
