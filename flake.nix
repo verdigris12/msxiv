@@ -14,7 +14,7 @@
     packages.${system} = {
       msxiv = pkgs.stdenv.mkDerivation {
         pname = "msxiv";
-        version = "0.1";
+        version = "0.1.1";
         src = ./.;
 
         nativeBuildInputs = [
