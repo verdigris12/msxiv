@@ -420,15 +420,29 @@ static void render_gallery(Display *dpy, Window win, ViewerData *vdata) {
     int columns = availableWidth / (THUMB_SIZE_W + THUMB_SPACING_X);
     if (columns < 1) columns = 1;
     int availableHeight = xwa.height - GALLERY_OFFSET_Y - CMD_BAR_HEIGHT;
-    int rows = availableHeight / (THUMB_SIZE_H + THUMB_SPACING_Y);
-    if (rows < 1) rows = 1;
-    int visibleCount = columns * rows;
-
-    /* Adjust scroll offset so that the selected image is visible */
-    if (g_gallery_select < g_gallery_scroll)
-        g_gallery_scroll = g_gallery_select;
-    else if (g_gallery_select >= g_gallery_scroll + visibleCount)
-        g_gallery_scroll = g_gallery_select - visibleCount + 1;
+    int visibleRows = availableHeight / (THUMB_SIZE_H + THUMB_SPACING_Y);
+    if (visibleRows < 1) visibleRows = 1;
+    int visibleCount = columns * visibleRows;
+    
+    /* Compute total number of rows */
+    int totalRows = (vdata->fileCount + columns - 1) / columns;
+    int selectedRow = g_gallery_select / columns;
+    
+    /* Determine scroll offset:
+       - If the selected row is less than (visibleRows - 1), don't scroll (keep top row visible).
+       - Otherwise, scroll so that the selected row appears as the second-to-last row,
+         but do not scroll further if the remaining rows fit in the window.
+    */
+    if (selectedRow < visibleRows - 1)
+        g_gallery_scroll = 0;
+    else {
+        int desiredRow = selectedRow - (visibleRows - 2);
+        /* Do not scroll beyond the last row that allows full visible rows */
+        int maxScrollRow = totalRows - visibleRows;
+        if (desiredRow > maxScrollRow)
+            desiredRow = maxScrollRow;
+        g_gallery_scroll = desiredRow * columns;
+    }
 
     /* Clear gallery background */
     XSetForeground(dpy, gc, g_gallery_bg_pixel);
@@ -663,15 +677,15 @@ static void execute_command_line(void) {
  */
 int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config) {
     g_config = config;
-    g_wand = NULL; 
-    g_gallery_mode = 0; 
-    g_thumbs = NULL; 
-    g_gallery_select = 0; 
+    g_wand = NULL;
+    g_gallery_mode = 0;
+    g_thumbs = NULL;
+    g_gallery_select = 0;
     g_gallery_scroll = 0;
-    g_command_input[0] = '\0'; 
-    g_command_len = 0; 
+    g_command_input[0] = '\0';
+    g_command_len = 0;
     g_command_mode = 0;
-    g_last_cmd_result[0] = '\0'; 
+    g_last_cmd_result[0] = '\0';
     g_status_mode = 0;
     *dpy = XOpenDisplay(NULL);
     if (!*dpy) { fprintf(stderr, "Cannot open display\n"); return -1; }
@@ -806,33 +820,44 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                                 XSync(dpy, False);
                             }
                             break;
-                        case XK_Left:
-                            if ((g_gallery_select % columns) != 0) g_gallery_select--;
-                            break;
                         case XK_Right:
-                            if (g_gallery_select < vdata->fileCount - 1 &&
-                                (g_gallery_select % columns) != (columns - 1))
+                            if (g_gallery_select < vdata->fileCount - 1) {
                                 g_gallery_select++;
+                            }
+                            break;
+                        case XK_Left:
+                            if (g_gallery_select > 0) {
+                                g_gallery_select--;
+                            }
                             break;
                         case XK_Up:
-                            if (g_gallery_select - columns >= 0) g_gallery_select -= columns;
+                            if (g_gallery_select - columns >= 0)
+                                g_gallery_select -= columns;
                             break;
                         case XK_Down:
-                            if (g_gallery_select + columns < vdata->fileCount) g_gallery_select += columns;
+                            if (g_gallery_select + columns < vdata->fileCount)
+                                g_gallery_select += columns;
                             break;
                         default: break;
                     }
-                    /* Adjust scroll offset so that selection is visible */
-                    int availableHeight = xwa.height - GALLERY_OFFSET_Y - CMD_BAR_HEIGHT;
-                    int rows = availableHeight / (THUMB_SIZE_H + THUMB_SPACING_Y);
-                    if (rows < 1) rows = 1;
-                    int visibleCount = columns * rows;
-                    if (g_gallery_select < g_gallery_scroll)
-                        g_gallery_scroll = g_gallery_select;
-                    else if (g_gallery_select >= g_gallery_scroll + visibleCount)
-                        g_gallery_scroll = g_gallery_select - visibleCount + 1;
+                    /* Recalculate scroll offset with our improved rules */
+                    {
+                        int totalRows = (vdata->fileCount + columns - 1) / columns;
+                        int visibleRows = (xwa.height - GALLERY_OFFSET_Y - CMD_BAR_HEIGHT) / (THUMB_SIZE_H + THUMB_SPACING_Y);
+                        if (visibleRows < 1) visibleRows = 1;
+                        int selectedRow = g_gallery_select / columns;
+                        if (selectedRow < visibleRows - 1)
+                            g_gallery_scroll = 0;
+                        else {
+                            int desiredRow = selectedRow - (visibleRows - 2);
+                            int maxScrollRow = totalRows - visibleRows;
+                            if (desiredRow > maxScrollRow)
+                                desiredRow = maxScrollRow;
+                            g_gallery_scroll = desiredRow * columns;
+                        }
+                    }
                     if (g_gallery_mode)
-                      render_gallery(dpy, win, vdata);
+                        render_gallery(dpy, win, vdata);
                 } else if (g_command_mode) {
                     if (ks == XK_Return) {
                         g_command_input[g_command_len] = '\0';
@@ -849,9 +874,9 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                         g_command_len = 0;
                         g_command_input[0] = '\0';
                         render_image(dpy, win);
-                    } else if (ks == XK_Tab) { 
-                        try_tab_completion(); 
-                        render_image(dpy, win); 
+                    } else if (ks == XK_Tab) {
+                        try_tab_completion();
+                        render_image(dpy, win);
                     } else {
                         if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
                             if (g_command_len < (int)(sizeof(g_command_input)-1)) {
@@ -917,22 +942,22 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             break;
                         case XK_plus:
                         case XK_equal:
-                            if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) { 
-                                g_fit_mode = 1; 
-                                fit_zoom(dpy, win); 
-                            } else { 
-                                g_fit_mode = 0; 
-                                g_zoom += ZOOM_STEP; 
-                                if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM; 
-                                generate_scaled_ximg(dpy); 
+                            if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
+                                g_fit_mode = 1;
+                                fit_zoom(dpy, win);
+                            } else {
+                                g_fit_mode = 0;
+                                g_zoom += ZOOM_STEP;
+                                if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
+                                generate_scaled_ximg(dpy);
                             }
                             render_image(dpy, win);
                             break;
                         case XK_minus:
-                            g_fit_mode = 0; 
-                            g_zoom -= ZOOM_STEP; 
-                            if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM; 
-                            generate_scaled_ximg(dpy); 
+                            g_fit_mode = 0;
+                            g_zoom -= ZOOM_STEP;
+                            if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
+                            generate_scaled_ximg(dpy);
                             render_image(dpy, win);
                             break;
                         case XK_Escape:
@@ -947,16 +972,16 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
             case ButtonPress:
                 if (!g_gallery_mode) {
                     if (ev.xbutton.button == 4 && is_ctrl_pressed && g_wand) {
-                        g_fit_mode = 0; 
-                        g_zoom += ZOOM_STEP; 
+                        g_fit_mode = 0;
+                        g_zoom += ZOOM_STEP;
                         if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
-                        generate_scaled_ximg(dpy); 
+                        generate_scaled_ximg(dpy);
                         render_image(dpy, win);
                     } else if (ev.xbutton.button == 5 && is_ctrl_pressed && g_wand) {
-                        g_fit_mode = 0; 
-                        g_zoom -= ZOOM_STEP; 
+                        g_fit_mode = 0;
+                        g_zoom -= ZOOM_STEP;
                         if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
-                        generate_scaled_ximg(dpy); 
+                        generate_scaled_ximg(dpy);
                         render_image(dpy, win);
                     }
                 }
@@ -977,4 +1002,3 @@ void viewer_cleanup(Display *dpy) {
         XCloseDisplay(dpy);
     }
 }
-
