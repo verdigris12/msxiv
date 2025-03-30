@@ -475,40 +475,73 @@ static void free_scaled_ximg(void)
 
 static void generate_scaled_ximg(Display *dpy)
 {
-	free_scaled_ximg();
-	if (!g_wand) return;
+    free_scaled_ximg();
+    if (!g_wand) return;
 
-	int sw = (int)(g_img_width  * g_zoom);
-	int sh = (int)(g_img_height * g_zoom);
-	if (sw <= 0 || sh <= 0) return;
+    int sw = (int)(g_img_width  * g_zoom);
+    int sh = (int)(g_img_height * g_zoom);
+    if (sw <= 0 || sh <= 0) return;
 
-	MagickWand *tmp = CloneMagickWand(g_wand);
-	MagickResizeImage(tmp, sw, sh, LanczosFilter);
-	MagickSetImageFormat(tmp, "RGBA");
+    MagickWand *tmp = CloneMagickWand(g_wand);
+    MagickResizeImage(tmp, sw, sh, LanczosFilter);
 
-	size_t length = sw * sh * 4;
-	unsigned char *blob = MagickGetImageBlob(tmp, &length);
+    int screen = DefaultScreen(dpy);
+    int depth = DefaultDepth(dpy, screen);
+    Visual *visual = DefaultVisual(dpy, screen);
 
-	XImage *xi = XCreateImage(dpy,
-	                          DefaultVisual(dpy, DefaultScreen(dpy)),
-	                          24, ZPixmap, 0,
-	                          (char *)malloc(sw * sh * 4),
-	                          sw, sh,
-	                          32, 0);
-	if (!xi) {
-		fprintf(stderr, "Failed to allocate scaled XImage.\n");
-		MagickRelinquishMemory(blob);
-		DestroyMagickWand(tmp);
-		return;
-	}
-	memcpy(xi->data, blob, sw * sh * 4);
+    // Debug info
+    fprintf(stderr, "Using visual depth=%d, red_mask=0x%lx, green_mask=0x%lx, blue_mask=0x%lx\n",
+            depth, visual->red_mask, visual->green_mask, visual->blue_mask);
 
-	g_scaled_ximg = xi;
-	g_scaled_w    = sw;
-	g_scaled_h    = sh;
+    // Create XImage with the specified depth and a bitmap_pad of 32 (i.e. 4 bytes per pixel)
+    XImage *xi = XCreateImage(dpy, visual,
+                              depth,        // using the screen's depth
+                              ZPixmap, 0,
+                              NULL,
+                              sw, sh,
+                              32,           // bitmap_pad = 32 for 32-bit alignment
+                              0);           // bytes_per_line will be auto-computed
+    if (!xi) {
+        fprintf(stderr, "Failed to allocate scaled XImage. Depth=%d\n", depth);
+        DestroyMagickWand(tmp);
+        return;
+    }
 
-	MagickRelinquishMemory(blob);
-	DestroyMagickWand(tmp);
+    // Allocate the image data buffer
+    xi->data = (char *)malloc(xi->bytes_per_line * sh);
+    if (!xi->data) {
+        fprintf(stderr, "Failed to allocate XImage data buffer.\n");
+        XFree(xi);
+        DestroyMagickWand(tmp);
+        return;
+    }
+
+    // Choose the export format using a 32-bit layout.
+    // For little-endian systems, use "BGRA", and for big-endian use "RGBA".
+    const char *pixFormat;
+    if (visual->red_mask == 0xff0000 && visual->green_mask == 0xff00 && visual->blue_mask == 0xff) {
+        pixFormat = "BGRA";  // Updated for little-endian systems
+    } else if (visual->red_mask == 0xff && visual->green_mask == 0xff00 && visual->blue_mask == 0xff0000) {
+        pixFormat = "RGBA";  // Updated for big-endian systems
+    } else {
+        fprintf(stderr, "Unsupported visual masks. Using BGRA as fallback.\n");
+        pixFormat = "BGRA";
+    }
+
+    // Export the pixels in the correct format
+    if (MagickExportImagePixels(tmp, 0, 0, sw, sh, pixFormat, CharPixel, xi->data) == MagickFalse) {
+        fprintf(stderr, "Failed to export pixels.\n");
+        free(xi->data);
+        XFree(xi);
+        DestroyMagickWand(tmp);
+        return;
+    }
+
+    g_scaled_ximg = xi;
+    g_scaled_w = sw;
+    g_scaled_h = sh;
+
+    DestroyMagickWand(tmp);
 }
 
 static void fit_zoom(Display *dpy, Window win)
@@ -851,237 +884,252 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata)
 {
 	XEvent ev;
 	int is_ctrl_pressed = 0;
+  int prev_win_w = 0, prev_win_h = 0; // Track previous window dimensions
 
 	while (1) {
 		XNextEvent(dpy, &ev);
 
 		switch (ev.type) {
-		case Expose:
-		case ConfigureNotify:
-			if (g_gallery_mode) {
-				render_gallery(dpy, win, vdata);
-			} else {
-				if (ev.type == ConfigureNotify && g_fit_mode && g_wand) {
-					fit_zoom(dpy, win);
-				}
-				render_image(dpy, win);
-			}
-			break;
+      case Expose:
+        if (g_gallery_mode) {
+          render_gallery(dpy, win, vdata);
+        } else {
+          render_image(dpy, win);
+        }
+        break;
 
-		case ClientMessage:
-			if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) {
-				return;
-			}
-			break;
+      case ConfigureNotify: {
+        XConfigureEvent *cev = &ev.xconfigure;
+        // Check if window size actually changed
+        if (cev->width != prev_win_w || cev->height != prev_win_h) {
+          prev_win_w = cev->width;
+          prev_win_h = cev->height;
+          if (!g_gallery_mode && g_fit_mode && g_wand) {
+            fit_zoom(dpy, win);
+          }
+        }
+        if (g_gallery_mode) {
+          render_gallery(dpy, win, vdata);
+        } else {
+          render_image(dpy, win);
+        }
+        break;
+      }
 
-		case DestroyNotify:
-			return;
+      case ClientMessage:
+        if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) {
+          return;
+        }
+        break;
 
-		case KeyPress: {
-			KeySym ks;
-			XComposeStatus comp;
-			char buf[32];
-			int len = XLookupString(&ev.xkey, buf, sizeof(buf)-1, &ks, &comp);
-			buf[len] = '\0';
+      case DestroyNotify:
+        return;
 
-			if (g_gallery_mode) {
-				/* GALLERY MODE */
-				switch (ks) {
-				case XK_q:
-					return;
-				case XK_Escape:
-					g_gallery_mode = 0;
-					render_image(dpy, win);
-					break;
-				case XK_Return:
-				case XK_KP_Enter:
-					if (g_gallery_select >= 0 &&
-					    g_gallery_select < vdata->fileCount) {
-						vdata->currentIndex = g_gallery_select;
-						g_gallery_mode = 0;
-						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-						render_image(dpy, win);
-					}
-					break;
-				case XK_Left:
-					if ((g_gallery_select % GALLERY_COLS) != 0) {
-						g_gallery_select--;
-					}
-					render_gallery(dpy, win, vdata);
-					break;
-				case XK_Right:
-					if (g_gallery_select < vdata->fileCount - 1 &&
-					    (g_gallery_select % GALLERY_COLS) != (GALLERY_COLS - 1)) {
-						g_gallery_select++;
-					}
-					render_gallery(dpy, win, vdata);
-					break;
-				case XK_Up:
-					if (g_gallery_select - GALLERY_COLS >= 0) {
-						g_gallery_select -= GALLERY_COLS;
-					}
-					render_gallery(dpy, win, vdata);
-					break;
-				case XK_Down:
-					if (g_gallery_select + GALLERY_COLS < vdata->fileCount) {
-						g_gallery_select += GALLERY_COLS;
-					}
-					render_gallery(dpy, win, vdata);
-					break;
-				default:
-					break;
-				}
-			} else if (g_command_mode) {
-				/* COMMAND MODE */
-				if (ks == XK_Return) {
-					/* finalize command and run it */
-					g_command_input[g_command_len] = '\0';
-					g_command_mode = 0;
-					execute_command_line();
-					g_command_len = 0;
-					g_command_input[0] = '\0';
-					render_image(dpy, win);
-				} else if (ks == XK_BackSpace || ks == XK_Delete) {
-					if (g_command_len > 0) {
-						g_command_len--;
-						g_command_input[g_command_len] = '\0';
-					}
-					render_image(dpy, win);
-				} else if (ks == XK_Escape) {
-					/* Cancel command mode, revert to normal mode */
-					g_command_mode = 0;
-					g_command_len  = 0;
-					g_command_input[0] = '\0';
-					render_image(dpy, win);
-				} else if (ks == XK_Tab) {
-					try_tab_completion();
-					render_image(dpy, win);
-				} else {
-					if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
-						if (g_command_len < (int)(sizeof(g_command_input) - 1)) {
-							g_command_input[g_command_len++] = buf[0];
-							g_command_input[g_command_len] = '\0';
-						}
-					}
-					render_image(dpy, win);
-				}
-			} else {
-				/* NORMAL MODE */
-				is_ctrl_pressed = ((ev.xkey.state & ControlMask) != 0);
+      case KeyPress: {
+        KeySym ks;
+        XComposeStatus comp;
+        char buf[32];
+        int len = XLookupString(&ev.xkey, buf, sizeof(buf)-1, &ks, &comp);
+        buf[len] = '\0';
 
-				if (len == 1 && buf[0] == ':') {
-					/* Enter command mode */
-					g_command_mode = 1;
-					g_command_len  = 1;
-					g_command_input[0] = ':';
-					g_command_input[1] = '\0';
-					render_image(dpy, win);
-					break;
-				}
+        if (g_gallery_mode) {
+          /* GALLERY MODE */
+          switch (ks) {
+            case XK_q:
+              return;
+            case XK_Escape:
+              g_gallery_mode = 0;
+              render_image(dpy, win);
+              break;
+            case XK_Return:
+            case XK_KP_Enter:
+              if (g_gallery_select >= 0 &&
+                g_gallery_select < vdata->fileCount) {
+                vdata->currentIndex = g_gallery_select;
+                g_gallery_mode = 0;
+                load_image(dpy, win, vdata->files[vdata->currentIndex]);
+                render_image(dpy, win);
+              }
+              break;
+            case XK_Left:
+              if ((g_gallery_select % GALLERY_COLS) != 0) {
+                g_gallery_select--;
+              }
+              render_gallery(dpy, win, vdata);
+              break;
+            case XK_Right:
+              if (g_gallery_select < vdata->fileCount - 1 &&
+                (g_gallery_select % GALLERY_COLS) != (GALLERY_COLS - 1)) {
+                g_gallery_select++;
+              }
+              render_gallery(dpy, win, vdata);
+              break;
+            case XK_Up:
+              if (g_gallery_select - GALLERY_COLS >= 0) {
+                g_gallery_select -= GALLERY_COLS;
+              }
+              render_gallery(dpy, win, vdata);
+              break;
+            case XK_Down:
+              if (g_gallery_select + GALLERY_COLS < vdata->fileCount) {
+                g_gallery_select += GALLERY_COLS;
+              }
+              render_gallery(dpy, win, vdata);
+              break;
+            default:
+              break;
+          }
+        } else if (g_command_mode) {
+          /* COMMAND MODE */
+          if (ks == XK_Return) {
+            /* finalize command and run it */
+            g_command_input[g_command_len] = '\0';
+            g_command_mode = 0;
+            execute_command_line();
+            g_command_len = 0;
+            g_command_input[0] = '\0';
+            render_image(dpy, win);
+          } else if (ks == XK_BackSpace || ks == XK_Delete) {
+            if (g_command_len > 0) {
+              g_command_len--;
+              g_command_input[g_command_len] = '\0';
+            }
+            render_image(dpy, win);
+          } else if (ks == XK_Escape) {
+            /* Cancel command mode, revert to normal mode */
+            g_command_mode = 0;
+            g_command_len  = 0;
+            g_command_input[0] = '\0';
+            render_image(dpy, win);
+          } else if (ks == XK_Tab) {
+            try_tab_completion();
+            render_image(dpy, win);
+          } else {
+            if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
+              if (g_command_len < (int)(sizeof(g_command_input) - 1)) {
+                g_command_input[g_command_len++] = buf[0];
+                g_command_input[g_command_len] = '\0';
+              }
+            }
+            render_image(dpy, win);
+          }
+        } else {
+          /* NORMAL MODE */
+          is_ctrl_pressed = ((ev.xkey.state & ControlMask) != 0);
 
-				switch (ks) {
-				case XK_q:
-					return;
-				case XK_space:
-					if (vdata->currentIndex < vdata->fileCount - 1) {
-						vdata->currentIndex++;
-						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-						render_image(dpy, win);
-					}
-					break;
-				case XK_BackSpace:
-					if (vdata->currentIndex > 0) {
-						vdata->currentIndex--;
-						load_image(dpy, win, vdata->files[vdata->currentIndex]);
-						render_image(dpy, win);
-					}
-					break;
-				case XK_Return:
-				case XK_KP_Enter:
-					if (vdata->fileCount > 1) {
-						g_gallery_mode = 1;
-						g_gallery_select = vdata->currentIndex;
-						render_gallery(dpy, win, vdata);
-					}
-					break;
-				case XK_w:
-				case XK_Up:
-					g_pan_y -= 50;
-					render_image(dpy, win);
-					break;
-				case XK_s:
-				case XK_Down:
-					g_pan_y += 50;
-					render_image(dpy, win);
-					break;
-				case XK_a:
-				case XK_Left:
-					g_pan_x -= 50;
-					render_image(dpy, win);
-					break;
-				case XK_d:
-				case XK_Right:
-					g_pan_x += 50;
-					render_image(dpy, win);
-					break;
-				case XK_plus:
-				case XK_equal:
-					if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
-						g_fit_mode = 1;
-						fit_zoom(dpy, win);
-					} else {
-						g_fit_mode = 0;
-						g_zoom += ZOOM_STEP;
-						if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
-						generate_scaled_ximg(dpy);
-					}
-					render_image(dpy, win);
-					break;
-				case XK_minus:
-					g_fit_mode = 0;
-					g_zoom -= ZOOM_STEP;
-					if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
-					generate_scaled_ximg(dpy);
-					render_image(dpy, win);
-					break;
-				case XK_Escape:
-					/* If user hits ESC in normal mode, we show file path again */
-					g_status_mode = 0;
-					render_image(dpy, win);
-					break;
-				default:
-					break;
-				}
-			}
-		} break;
+          if (len == 1 && buf[0] == ':') {
+            /* Enter command mode */
+            g_command_mode = 1;
+            g_command_len  = 1;
+            g_command_input[0] = ':';
+            g_command_input[1] = '\0';
+            render_image(dpy, win);
+            break;
+          }
 
-		case ButtonPress:
-			if (!g_gallery_mode) {
-				if (ev.xbutton.button == 4) {
-					if (is_ctrl_pressed && g_wand) {
-						g_fit_mode = 0;
-						g_zoom += ZOOM_STEP;
-						if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
-						generate_scaled_ximg(dpy);
-						render_image(dpy, win);
-					}
-				} else if (ev.xbutton.button == 5) {
-					if (is_ctrl_pressed && g_wand) {
-						g_fit_mode = 0;
-						g_zoom -= ZOOM_STEP;
-						if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
-						generate_scaled_ximg(dpy);
-						render_image(dpy, win);
-					}
-				}
-			}
-			break;
+          switch (ks) {
+            case XK_q:
+              return;
+            case XK_space:
+              if (vdata->currentIndex < vdata->fileCount - 1) {
+                vdata->currentIndex++;
+                load_image(dpy, win, vdata->files[vdata->currentIndex]);
+                render_image(dpy, win);
+              }
+              break;
+            case XK_BackSpace:
+              if (vdata->currentIndex > 0) {
+                vdata->currentIndex--;
+                load_image(dpy, win, vdata->files[vdata->currentIndex]);
+                render_image(dpy, win);
+              }
+              break;
+            case XK_Return:
+            case XK_KP_Enter:
+              if (vdata->fileCount > 1) {
+                g_gallery_mode = 1;
+                g_gallery_select = vdata->currentIndex;
+                render_gallery(dpy, win, vdata);
+              }
+              break;
+            case XK_w:
+            case XK_Up:
+              g_pan_y -= 50;
+              render_image(dpy, win);
+              break;
+            case XK_s:
+            case XK_Down:
+              g_pan_y += 50;
+              render_image(dpy, win);
+              break;
+            case XK_a:
+            case XK_Left:
+              g_pan_x -= 50;
+              render_image(dpy, win);
+              break;
+            case XK_d:
+            case XK_Right:
+              g_pan_x += 50;
+              render_image(dpy, win);
+              break;
+            case XK_plus:
+            case XK_equal:
+              if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) {
+                g_fit_mode = 1;
+                fit_zoom(dpy, win);
+              } else {
+                g_fit_mode = 0;
+                g_zoom += ZOOM_STEP;
+                if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
+                generate_scaled_ximg(dpy);
+              }
+              render_image(dpy, win);
+              break;
+            case XK_minus:
+              g_fit_mode = 0;
+              g_zoom -= ZOOM_STEP;
+              if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
+              generate_scaled_ximg(dpy);
+              render_image(dpy, win);
+              break;
+            case XK_Escape:
+              /* If user hits ESC in normal mode, we show file path again */
+              g_status_mode = 0;
+              render_image(dpy, win);
+              break;
+            default:
+              break;
+          }
+        }
+      } break;
 
-		case ButtonRelease:
-			break;
+      case ButtonPress:
+        if (!g_gallery_mode) {
+          if (ev.xbutton.button == 4) {
+            if (is_ctrl_pressed && g_wand) {
+              g_fit_mode = 0;
+              g_zoom += ZOOM_STEP;
+              if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
+              generate_scaled_ximg(dpy);
+              render_image(dpy, win);
+            }
+          } else if (ev.xbutton.button == 5) {
+            if (is_ctrl_pressed && g_wand) {
+              g_fit_mode = 0;
+              g_zoom -= ZOOM_STEP;
+              if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
+              generate_scaled_ximg(dpy);
+              render_image(dpy, win);
+            }
+          }
+        }
+        break;
 
-		case MotionNotify:
-			break;
+      case ButtonRelease:
+        break;
+
+      case MotionNotify:
+        break;
 		}
 	}
 }
