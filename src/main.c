@@ -22,7 +22,7 @@ static int is_duplicate(const char *path, char **files, int count)
 static int can_open_image(const char *path)
 {
 	MagickWand *testWand = NewMagickWand();
-	if (MagickReadImage(testWand, path) == MagickFalse) {
+	if (MagickPingImage(testWand, path) == MagickFalse) {
 		DestroyMagickWand(testWand);
 		return 0;
 	}
