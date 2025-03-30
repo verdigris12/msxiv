@@ -22,7 +22,6 @@
 #define CMD_BAR_HEIGHT    15
 #define CMD_BAR_FONT      "monospace"
 
-#define GALLERY_COLS      4
 #define THUMB_SIZE_W      128
 #define THUMB_SIZE_H      128
 #define THUMB_SPACING_X   10
@@ -43,6 +42,13 @@
  */
 static int g_fit_mode     = 1;
 static int g_gallery_mode = 0;
+
+/* In gallery mode, we maintain an absolute selection index and a scroll offset */
+static int g_gallery_select = 0;
+static int g_gallery_scroll = 0;
+
+/* Global flag for thumbnail thread control */
+static volatile int g_thumbnail_thread_active = 0;
 
 static XImage     *g_scaled_ximg = NULL;
 static int         g_scaled_w     = 0;
@@ -86,7 +92,6 @@ typedef struct {
 } GalleryThumb;
 
 static GalleryThumb *g_thumbs = NULL;
-static int g_gallery_select = 0;
 
 /*
  * =========================
@@ -263,7 +268,7 @@ static void try_tab_completion(void) {
  * GALLERY THUMBNAILS
  * =========================
  *
- * The thumbnail generation now mirrors the main image scaling logic.
+ * The thumbnail generation mirrors the main image scaling logic.
  */
 static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, int *out_h) {
     MagickWand *twand = NewMagickWand();
@@ -303,7 +308,7 @@ static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, 
     return xi;
 }
 
-/* Helper structure for passing arguments to the thumbnail thread */
+/* Helper structure for thumbnail thread arguments */
 typedef struct {
     Display *dpy;
     Window win;
@@ -311,36 +316,73 @@ typedef struct {
     char **files;
 } ThumbnailThreadArgs;
 
-/* Thread function to generate gallery thumbnails */
-static void *thumbnail_thread_func(void *arg) {
-    ThumbnailThreadArgs *targs = (ThumbnailThreadArgs *)arg;
-    generate_gallery_thumbnails(targs->dpy, targs->fileCount, targs->files);
-    /* Force a redraw so that an Expose event is generated and render_gallery gets called */
-    if (g_gallery_mode) {
-      XClearWindow(targs->dpy, targs->win);
-      XSync(targs->dpy, False);
-    }
-    free(targs);
+/* Structure for a thumbnail job */
+typedef struct {
+    Display *dpy;
+    char    *filename;
+    int      index;
+} ThumbnailJobArgs;
+
+static void *thumbnail_job_func(void *arg) {
+    ThumbnailJobArgs *job = (ThumbnailJobArgs *)arg;
+    int tw = 0, th = 0;
+    XImage *xi = create_thumbnail(job->dpy, job->filename, &tw, &th);
+    g_thumbs[job->index].ximg = xi;
+    g_thumbs[job->index].w = tw;
+    g_thumbs[job->index].h = th;
+    free(job);
     return NULL;
 }
 
-/* This function remains unchanged except that it may be called from a separate thread */
 void generate_gallery_thumbnails(Display *dpy, int fileCount, char **files) {
     g_thumbs = calloc(fileCount, sizeof(GalleryThumb));
     if (!g_thumbs) {
         fprintf(stderr, "Failed to allocate gallery thumbnails.\n");
         return;
     }
-    for (int i = 0; i < fileCount; i++) {
-        int tw = 0, th = 0;
-        XImage *xi = create_thumbnail(dpy, files[i], &tw, &th);
-        g_thumbs[i].ximg = xi;
-        g_thumbs[i].w = tw;
-        g_thumbs[i].h = th;
+    pthread_t *threads = malloc(sizeof(pthread_t) * fileCount);
+    if (!threads) {
+        fprintf(stderr, "Failed to allocate thread array.\n");
+        free(g_thumbs);
+        g_thumbs = NULL;
+        return;
     }
-    g_gallery_select = 0;
+    for (int i = 0; i < fileCount; i++) {
+        ThumbnailJobArgs *job = malloc(sizeof(ThumbnailJobArgs));
+        if (!job) {
+            fprintf(stderr, "Out of memory for thumbnail job.\n");
+            continue;
+        }
+        job->dpy = dpy;
+        job->filename = files[i];  /* Do not duplicate: validFiles already allocated elsewhere */
+        job->index = i;
+        if (pthread_create(&threads[i], NULL, thumbnail_job_func, job) != 0) {
+            fprintf(stderr, "Failed to create thumbnail thread for file: %s\n", files[i]);
+            free(job);
+        }
+    }
+    /* Wait for all job threads to finish */
+    for (int i = 0; i < fileCount; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+    /* Reset scroll offset */
+    g_gallery_scroll = 0;
 }
 
+/* Thumbnail thread function remains largely the same */
+static void *thumbnail_thread_func(void *arg) {
+    ThumbnailThreadArgs *targs = (ThumbnailThreadArgs *)arg;
+    generate_gallery_thumbnails(targs->dpy, targs->fileCount, targs->files);
+    /* Only force a redraw if we're still in gallery mode and allowed */
+    if (g_gallery_mode && g_thumbnail_thread_active) {
+        XClearWindow(targs->dpy, targs->win);
+        XSync(targs->dpy, False);
+    }
+    free(targs);
+    return NULL;
+}
+/* Free gallery thumbnails */
 static void free_gallery_thumbnails(int fileCount) {
     if (!g_thumbs) return;
     for (int i = 0; i < fileCount; i++) {
@@ -353,21 +395,48 @@ static void free_gallery_thumbnails(int fileCount) {
     g_thumbs = NULL;
 }
 
+/*
+ * =========================
+ * Adaptive Gallery Rendering
+ * =========================
+ */
 static void render_gallery(Display *dpy, Window win, ViewerData *vdata) {
     if (!g_thumbs) return;
     XWindowAttributes xwa;
     XGetWindowAttributes(dpy, win, &xwa);
     GC gc = DefaultGC(dpy, DefaultScreen(dpy));
+
+    /* Compute adaptive grid dimensions */
+    int availableWidth = xwa.width - 2 * GALLERY_OFFSET_X;
+    int columns = availableWidth / (THUMB_SIZE_W + THUMB_SPACING_X);
+    if (columns < 1) columns = 1;
+    int availableHeight = xwa.height - GALLERY_OFFSET_Y - CMD_BAR_HEIGHT;
+    int rows = availableHeight / (THUMB_SIZE_H + THUMB_SPACING_Y);
+    if (rows < 1) rows = 1;
+    int visibleCount = columns * rows;
+
+    /* Adjust scroll offset so that the selected image is visible */
+    if (g_gallery_select < g_gallery_scroll)
+        g_gallery_scroll = g_gallery_select;
+    else if (g_gallery_select >= g_gallery_scroll + visibleCount)
+        g_gallery_scroll = g_gallery_select - visibleCount + 1;
+
+    /* Clear gallery background */
     XSetForeground(dpy, gc, g_gallery_bg_pixel);
     XFillRectangle(dpy, win, gc, 0, 0, xwa.width, xwa.height);
+
+    /* Render visible thumbnails */
     int count = vdata->fileCount;
-    for (int i = 0; i < count; i++) {
-        GalleryThumb *th = &g_thumbs[i];
-        if (!th->ximg) continue;
-        int row = i / GALLERY_COLS;
-        int col = i % GALLERY_COLS;
+    int end = g_gallery_scroll + visibleCount;
+    if (end > count) end = count;
+    for (int i = g_gallery_scroll; i < end; i++) {
+        int cell = i - g_gallery_scroll;
+        int row = cell / columns;
+        int col = cell % columns;
         int x = GALLERY_OFFSET_X + col * (THUMB_SIZE_W + THUMB_SPACING_X);
         int y = GALLERY_OFFSET_Y + row * (THUMB_SIZE_H + THUMB_SPACING_Y);
+        GalleryThumb *th = &g_thumbs[i];
+        if (!th->ximg) continue;
         int dx = (THUMB_SIZE_W - th->w) / 2;
         int dy = (THUMB_SIZE_H - th->h) / 2;
         XPutImage(dpy, win, gc, th->ximg, 0, 0, x + dx, y + dy, th->w, th->h);
@@ -376,6 +445,17 @@ static void render_gallery(Display *dpy, Window win, ViewerData *vdata) {
             XDrawRectangle(dpy, win, gc, x, y, THUMB_SIZE_W, THUMB_SIZE_H);
         }
     }
+
+    /* Draw status bar with [i/N] and the selected filename */
+    char status[512];
+    const char *selName = (g_gallery_select < count) ? vdata->files[g_gallery_select] : "";
+    snprintf(status, sizeof(status), "[%d/%d] %s", g_gallery_select + 1, count, selName);
+    int bar_y = xwa.height - CMD_BAR_HEIGHT;
+    XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
+    XFillRectangle(dpy, win, gc, 0, bar_y, xwa.width, CMD_BAR_HEIGHT);
+    XSetForeground(dpy, gc, g_text_pixel);
+    if (g_cmdFont) XSetFont(dpy, gc, g_cmdFont->fid);
+    XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3, status, strlen(status));
 }
 
 /*
@@ -524,10 +604,7 @@ static void render_image(Display *dpy, Window win) {
     if (g_command_mode)
         XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3, g_command_input, strlen(g_command_input));
     else {
-        if (g_status_mode == 1)
-            XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3, g_last_cmd_result, strlen(g_last_cmd_result));
-        else
-            XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3, g_filename, strlen(g_filename));
+        XDrawString(dpy, win, gc, 5, bar_y + CMD_BAR_HEIGHT - 3, g_filename, strlen(g_filename));
     }
 }
 
@@ -577,7 +654,7 @@ static void execute_command_line(void) {
  */
 int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config) {
     g_config = config;
-    g_wand = NULL; g_gallery_mode = 0; g_thumbs = NULL; g_gallery_select = 0;
+    g_wand = NULL; g_gallery_mode = 0; g_thumbs = NULL; g_gallery_select = 0; g_gallery_scroll = 0;
     g_command_input[0] = '\0'; g_command_len = 0; g_command_mode = 0;
     g_last_cmd_result[0] = '\0'; g_status_mode = 0;
     *dpy = XOpenDisplay(NULL);
@@ -586,10 +663,14 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     *win = XCreateSimpleWindow(*dpy, RootWindow(*dpy, screen),
                                0, 0, 800, 600, 1,
                                BlackPixel(*dpy, screen), WhitePixel(*dpy, screen));
-    Colormap cmap = DefaultColormap(*dpy, screen);
-    XColor xcol;
-    if (XParseColor(*dpy, cmap, "#000000", &xcol) && XAllocColor(*dpy, cmap, &xcol)){
-      XSetWindowBackground(*dpy, *win, xcol.pixel);
+    /* Set the window background to a loading color (dark gray) */
+    {
+        Colormap cmap = DefaultColormap(*dpy, screen);
+        XColor xcol;
+        if (XParseColor(*dpy, cmap, "#2e2e2e", &xcol) && XAllocColor(*dpy, cmap, &xcol))
+            XSetWindowBackground(*dpy, *win, xcol.pixel);
+        else
+            XSetWindowBackground(*dpy, *win, WhitePixel(*dpy, screen));
     }
     XSelectInput(*dpy, *win, ExposureMask | KeyPressMask |
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
@@ -625,8 +706,9 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
         else
             g_gallery_bg_pixel = BlackPixel(*dpy, screen);
     }
-    /* Spawn a separate thread for thumbnail generation if more than one file is present */
+    /* Start thumbnail generation in a separate thread if multiple files */
     if (vdata->fileCount > 1) {
+        g_thumbnail_thread_active = 1;  /* Enable thumbnail redraws */
         ThumbnailThreadArgs *targs = malloc(sizeof(ThumbnailThreadArgs));
         if (targs) {
             targs->dpy = *dpy;
@@ -676,50 +758,71 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                 int len = XLookupString(&ev.xkey, buf, sizeof(buf)-1, &ks, &comp);
                 buf[len] = '\0';
                 if (g_gallery_mode) {
+                    /* Compute adaptive columns from window size */
+                    XWindowAttributes xwa;
+                    XGetWindowAttributes(dpy, win, &xwa);
+                    int availableWidth = xwa.width - 2 * GALLERY_OFFSET_X;
+                    int columns = availableWidth / (THUMB_SIZE_W + THUMB_SPACING_X);
+                    if (columns < 1) columns = 1;
                     switch (ks) {
                         case XK_q: return;
-                        case XK_Escape: g_gallery_mode = 0; render_image(dpy, win); break;
+                        case XK_Escape:
+                            g_gallery_mode = 0;
+                            g_thumbnail_thread_active = 0;
+                            render_image(dpy, win);
+                            break;
                         case XK_Return:
                         case XK_KP_Enter:
                             if (g_gallery_select >= 0 && g_gallery_select < vdata->fileCount) {
                                 vdata->currentIndex = g_gallery_select;
                                 g_gallery_mode = 0;
+                                g_thumbnail_thread_active = 0;
                                 load_image(dpy, win, vdata->files[vdata->currentIndex]);
                                 render_image(dpy, win);
+                                XSync(dpy, False);
                             }
                             break;
                         case XK_Left:
-                            if ((g_gallery_select % GALLERY_COLS) != 0) g_gallery_select--;
-                            render_gallery(dpy, win, vdata);
+                            if ((g_gallery_select % columns) != 0) g_gallery_select--;
                             break;
                         case XK_Right:
                             if (g_gallery_select < vdata->fileCount - 1 &&
-                                (g_gallery_select % GALLERY_COLS) != (GALLERY_COLS - 1))
+                                (g_gallery_select % columns) != (columns - 1))
                                 g_gallery_select++;
-                            render_gallery(dpy, win, vdata);
                             break;
                         case XK_Up:
-                            if (g_gallery_select - GALLERY_COLS >= 0) g_gallery_select -= GALLERY_COLS;
-                            render_gallery(dpy, win, vdata);
+                            if (g_gallery_select - columns >= 0) g_gallery_select -= columns;
                             break;
                         case XK_Down:
-                            if (g_gallery_select + GALLERY_COLS < vdata->fileCount) g_gallery_select += GALLERY_COLS;
-                            render_gallery(dpy, win, vdata);
+                            if (g_gallery_select + columns < vdata->fileCount) g_gallery_select += columns;
                             break;
                         default: break;
                     }
+                    /* Adjust scroll offset so that selection is visible */
+                    int availableHeight = xwa.height - GALLERY_OFFSET_Y - CMD_BAR_HEIGHT;
+                    int rows = availableHeight / (THUMB_SIZE_H + THUMB_SPACING_Y);
+                    if (rows < 1) rows = 1;
+                    int visibleCount = columns * rows;
+                    if (g_gallery_select < g_gallery_scroll)
+                        g_gallery_scroll = g_gallery_select;
+                    else if (g_gallery_select >= g_gallery_scroll + visibleCount)
+                        g_gallery_scroll = g_gallery_select - visibleCount + 1;
+                    render_gallery(dpy, win, vdata);
                 } else if (g_command_mode) {
                     if (ks == XK_Return) {
                         g_command_input[g_command_len] = '\0';
                         g_command_mode = 0;
                         execute_command_line();
-                        g_command_len = 0; g_command_input[0] = '\0';
+                        g_command_len = 0;
+                        g_command_input[0] = '\0';
                         render_image(dpy, win);
                     } else if (ks == XK_BackSpace || ks == XK_Delete) {
                         if (g_command_len > 0) { g_command_len--; g_command_input[g_command_len] = '\0'; }
                         render_image(dpy, win);
                     } else if (ks == XK_Escape) {
-                        g_command_mode = 0; g_command_len = 0; g_command_input[0] = '\0';
+                        g_command_mode = 0;
+                        g_command_len = 0;
+                        g_command_input[0] = '\0';
                         render_image(dpy, win);
                     } else if (ks == XK_Tab) { try_tab_completion(); render_image(dpy, win); }
                     else {
@@ -734,8 +837,12 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                 } else {
                     is_ctrl_pressed = ((ev.xkey.state & ControlMask) != 0);
                     if (len == 1 && buf[0] == ':') {
-                        g_command_mode = 1; g_command_len = 1; g_command_input[0] = ':'; g_command_input[1] = '\0';
-                        render_image(dpy, win); break;
+                        g_command_mode = 1;
+                        g_command_len = 1;
+                        g_command_input[0] = ':';
+                        g_command_input[1] = '\0';
+                        render_image(dpy, win);
+                        break;
                     }
                     switch (ks) {
                         case XK_q: return;
@@ -755,16 +862,33 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             break;
                         case XK_Return:
                         case XK_KP_Enter:
-                            if (vdata->fileCount > 1) { g_gallery_mode = 1; g_gallery_select = vdata->currentIndex; render_gallery(dpy, win, vdata); }
+                            if (vdata->fileCount > 1) {
+                                g_gallery_mode = 1;
+                                g_gallery_select = vdata->currentIndex;
+                                g_thumbnail_thread_active = 1;
+                                render_gallery(dpy, win, vdata);
+                            }
                             break;
                         case XK_w:
-                        case XK_Up: g_pan_y -= 50; render_image(dpy, win); break;
+                        case XK_Up:
+                            g_pan_y -= 50;
+                            render_image(dpy, win);
+                            break;
                         case XK_s:
-                        case XK_Down: g_pan_y += 50; render_image(dpy, win); break;
+                        case XK_Down:
+                            g_pan_y += 50;
+                            render_image(dpy, win);
+                            break;
                         case XK_a:
-                        case XK_Left: g_pan_x -= 50; render_image(dpy, win); break;
+                        case XK_Left:
+                            g_pan_x -= 50;
+                            render_image(dpy, win);
+                            break;
                         case XK_d:
-                        case XK_Right: g_pan_x += 50; render_image(dpy, win); break;
+                        case XK_Right:
+                            g_pan_x += 50;
+                            render_image(dpy, win);
+                            break;
                         case XK_plus:
                         case XK_equal:
                             if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) { g_fit_mode = 1; fit_zoom(dpy, win); }
@@ -772,8 +896,12 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             render_image(dpy, win);
                             break;
                         case XK_minus:
-                            g_fit_mode = 0; g_zoom -= ZOOM_STEP; if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM; generate_scaled_ximg(dpy); render_image(dpy, win); break;
-                        case XK_Escape: g_status_mode = 0; render_image(dpy, win); break;
+                            g_fit_mode = 0; g_zoom -= ZOOM_STEP; if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM; generate_scaled_ximg(dpy); render_image(dpy, win);
+                            break;
+                        case XK_Escape:
+                            g_status_mode = 0;
+                            render_image(dpy, win);
+                            break;
                         default: break;
                     }
                 }
