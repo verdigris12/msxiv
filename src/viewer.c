@@ -47,9 +47,6 @@ static int g_gallery_mode = 0;
 static int g_gallery_select = 0;
 static int g_gallery_scroll = 0;
 
-/* Global flag for thumbnail thread control */
-static volatile int g_thumbnail_thread_active = 0;
-
 static XImage     *g_scaled_ximg = NULL;
 static int         g_scaled_w     = 0;
 static int         g_scaled_h     = 0;
@@ -83,6 +80,9 @@ static unsigned long g_gallery_bg_pixel = 0;
 
 static XFontStruct *g_cmdFont = NULL;
 static Atom wmDeleteMessage;
+
+/* Custom event atom for thumbnail updates */
+static Atom gThumbnailUpdateEvent;
 
 /* Thumbnails for gallery mode */
 typedef struct {
@@ -370,18 +370,27 @@ void generate_gallery_thumbnails(Display *dpy, int fileCount, char **files) {
     g_gallery_scroll = 0;
 }
 
-/* Thumbnail thread function remains largely the same */
+/* Thumbnail thread function modified to post a custom event */
 static void *thumbnail_thread_func(void *arg) {
     ThumbnailThreadArgs *targs = (ThumbnailThreadArgs *)arg;
     generate_gallery_thumbnails(targs->dpy, targs->fileCount, targs->files);
-    /* Only force a redraw if we're still in gallery mode and allowed */
-    if (g_gallery_mode && g_thumbnail_thread_active) {
-        XClearWindow(targs->dpy, targs->win);
-        XSync(targs->dpy, False);
-    }
+    
+    /* Post a custom event to signal that the thumbnails are updated */
+    XClientMessageEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = ClientMessage;
+    ev.window = targs->win;
+    ev.message_type = gThumbnailUpdateEvent;
+    ev.format = 32;
+    ev.data.l[0] = 0;  /* reserved for future use */
+
+    XSendEvent(targs->dpy, targs->win, False, NoEventMask, (XEvent *)&ev);
+    XFlush(targs->dpy);
+
     free(targs);
     return NULL;
 }
+
 /* Free gallery thumbnails */
 static void free_gallery_thumbnails(int fileCount) {
     if (!g_thumbs) return;
@@ -654,9 +663,16 @@ static void execute_command_line(void) {
  */
 int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *config) {
     g_config = config;
-    g_wand = NULL; g_gallery_mode = 0; g_thumbs = NULL; g_gallery_select = 0; g_gallery_scroll = 0;
-    g_command_input[0] = '\0'; g_command_len = 0; g_command_mode = 0;
-    g_last_cmd_result[0] = '\0'; g_status_mode = 0;
+    g_wand = NULL; 
+    g_gallery_mode = 0; 
+    g_thumbs = NULL; 
+    g_gallery_select = 0; 
+    g_gallery_scroll = 0;
+    g_command_input[0] = '\0'; 
+    g_command_len = 0; 
+    g_command_mode = 0;
+    g_last_cmd_result[0] = '\0'; 
+    g_status_mode = 0;
     *dpy = XOpenDisplay(NULL);
     if (!*dpy) { fprintf(stderr, "Cannot open display\n"); return -1; }
     int screen = DefaultScreen(*dpy);
@@ -667,7 +683,7 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     {
         Colormap cmap = DefaultColormap(*dpy, screen);
         XColor xcol;
-        if (XParseColor(*dpy, cmap, "#2e2e2e", &xcol) && XAllocColor(*dpy, cmap, &xcol))
+        if (XParseColor(*dpy, cmap, "#000000", &xcol) && XAllocColor(*dpy, cmap, &xcol))
             XSetWindowBackground(*dpy, *win, xcol.pixel);
         else
             XSetWindowBackground(*dpy, *win, WhitePixel(*dpy, screen));
@@ -676,6 +692,8 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
     wmDeleteMessage = XInternAtom(*dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(*dpy, *win, &wmDeleteMessage, 1);
+    /* Register our custom event atom for thumbnail updates */
+    gThumbnailUpdateEvent = XInternAtom(*dpy, "THUMBNAIL_UPDATE", False);
     XMapWindow(*dpy, *win);
     XEvent e;
     while (1) { XNextEvent(*dpy, &e); if (e.type == MapNotify) break; }
@@ -708,7 +726,6 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     }
     /* Start thumbnail generation in a separate thread if multiple files */
     if (vdata->fileCount > 1) {
-        g_thumbnail_thread_active = 1;  /* Enable thumbnail redraws */
         ThumbnailThreadArgs *targs = malloc(sizeof(ThumbnailThreadArgs));
         if (targs) {
             targs->dpy = *dpy;
@@ -747,7 +764,16 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                 break;
             }
             case ClientMessage:
-                if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) return;
+                if (ev.xclient.message_type == gThumbnailUpdateEvent) {
+                    /* Only update if we are in gallery mode */
+                    if (g_gallery_mode) {
+                        XClearWindow(dpy, win);
+                        XFlush(dpy);
+                        render_gallery(dpy, win, vdata);
+                    }
+                } else if ((Atom)ev.xclient.data.l[0] == wmDeleteMessage) {
+                    return;
+                }
                 break;
             case DestroyNotify:
                 return;
@@ -768,7 +794,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                         case XK_q: return;
                         case XK_Escape:
                             g_gallery_mode = 0;
-                            g_thumbnail_thread_active = 0;
                             render_image(dpy, win);
                             break;
                         case XK_Return:
@@ -776,7 +801,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             if (g_gallery_select >= 0 && g_gallery_select < vdata->fileCount) {
                                 vdata->currentIndex = g_gallery_select;
                                 g_gallery_mode = 0;
-                                g_thumbnail_thread_active = 0;
                                 load_image(dpy, win, vdata->files[vdata->currentIndex]);
                                 render_image(dpy, win);
                                 XSync(dpy, False);
@@ -807,7 +831,8 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                         g_gallery_scroll = g_gallery_select;
                     else if (g_gallery_select >= g_gallery_scroll + visibleCount)
                         g_gallery_scroll = g_gallery_select - visibleCount + 1;
-                    render_gallery(dpy, win, vdata);
+                    if (g_gallery_mode)
+                      render_gallery(dpy, win, vdata);
                 } else if (g_command_mode) {
                     if (ks == XK_Return) {
                         g_command_input[g_command_len] = '\0';
@@ -824,8 +849,10 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                         g_command_len = 0;
                         g_command_input[0] = '\0';
                         render_image(dpy, win);
-                    } else if (ks == XK_Tab) { try_tab_completion(); render_image(dpy, win); }
-                    else {
+                    } else if (ks == XK_Tab) { 
+                        try_tab_completion(); 
+                        render_image(dpy, win); 
+                    } else {
                         if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
                             if (g_command_len < (int)(sizeof(g_command_input)-1)) {
                                 g_command_input[g_command_len++] = buf[0];
@@ -865,7 +892,6 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             if (vdata->fileCount > 1) {
                                 g_gallery_mode = 1;
                                 g_gallery_select = vdata->currentIndex;
-                                g_thumbnail_thread_active = 1;
                                 render_gallery(dpy, win, vdata);
                             }
                             break;
@@ -891,12 +917,23 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
                             break;
                         case XK_plus:
                         case XK_equal:
-                            if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) { g_fit_mode = 1; fit_zoom(dpy, win); }
-                            else { g_fit_mode = 0; g_zoom += ZOOM_STEP; if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM; generate_scaled_ximg(dpy); }
+                            if (ks == XK_equal && !(ev.xkey.state & ShiftMask)) { 
+                                g_fit_mode = 1; 
+                                fit_zoom(dpy, win); 
+                            } else { 
+                                g_fit_mode = 0; 
+                                g_zoom += ZOOM_STEP; 
+                                if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM; 
+                                generate_scaled_ximg(dpy); 
+                            }
                             render_image(dpy, win);
                             break;
                         case XK_minus:
-                            g_fit_mode = 0; g_zoom -= ZOOM_STEP; if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM; generate_scaled_ximg(dpy); render_image(dpy, win);
+                            g_fit_mode = 0; 
+                            g_zoom -= ZOOM_STEP; 
+                            if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM; 
+                            generate_scaled_ximg(dpy); 
+                            render_image(dpy, win);
                             break;
                         case XK_Escape:
                             g_status_mode = 0;
@@ -910,11 +947,17 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
             case ButtonPress:
                 if (!g_gallery_mode) {
                     if (ev.xbutton.button == 4 && is_ctrl_pressed && g_wand) {
-                        g_fit_mode = 0; g_zoom += ZOOM_STEP; if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
-                        generate_scaled_ximg(dpy); render_image(dpy, win);
+                        g_fit_mode = 0; 
+                        g_zoom += ZOOM_STEP; 
+                        if (g_zoom > MAX_ZOOM) g_zoom = MAX_ZOOM;
+                        generate_scaled_ximg(dpy); 
+                        render_image(dpy, win);
                     } else if (ev.xbutton.button == 5 && is_ctrl_pressed && g_wand) {
-                        g_fit_mode = 0; g_zoom -= ZOOM_STEP; if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
-                        generate_scaled_ximg(dpy); render_image(dpy, win);
+                        g_fit_mode = 0; 
+                        g_zoom -= ZOOM_STEP; 
+                        if (g_zoom < MIN_ZOOM) g_zoom = MIN_ZOOM;
+                        generate_scaled_ximg(dpy); 
+                        render_image(dpy, win);
                     }
                 }
                 break;
@@ -934,3 +977,4 @@ void viewer_cleanup(Display *dpy) {
         XCloseDisplay(dpy);
     }
 }
+
