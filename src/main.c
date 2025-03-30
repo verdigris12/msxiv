@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <search.h>
 #include <MagickWand/MagickWand.h>
+#include <X11/Xlib.h>
 
 #include "viewer.h"
 #include "config.h"
@@ -20,6 +21,36 @@ static int cmpstr(const void *a, const void *b) {
    Since validFiles owns the duplicated strings, we don't want tdestroy to free them. */
 static void noop_free(void *node) {
     /* do nothing */
+}
+
+/* Check MIME type using the `file` command.
+   Returns 1 if the file's MIME type starts with "image/", 0 otherwise. */
+static int check_mime(const char *filename) {
+    char command[1024];
+    snprintf(command, sizeof(command), "file --mime-type -b \"%s\"", filename);
+
+    FILE *fp = popen(command, "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to run file command on %s\n", filename);
+        return 0;
+    }
+
+    char mime[256];
+    if (fgets(mime, sizeof(mime), fp) == NULL) {
+        fprintf(stderr, "Failed to read MIME type for %s\n", filename);
+        pclose(fp);
+        return 0;
+    }
+    pclose(fp);
+
+    // Remove trailing newline if present.
+    mime[strcspn(mime, "\n")] = '\0';
+
+    if (strncmp(mime, "image/", 6) != 0) {
+        fprintf(stderr, "File %s excluded: MIME type '%s' is not an image.\n", filename, mime);
+        return 0;
+    }
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -47,21 +78,16 @@ int main(int argc, char **argv)
     }
     int validCount = 0;
 
-    /* Create a binary search tree root for duplicate checking.
-       The tree is used solely for duplicate detection. */
+    /* Create a binary search tree for duplicate checking. */
     void *dup_tree = NULL;
-    int i;
-    for (i = 1; i < argc; i++) {
-        printf("%d %s\n", i, argv[i]);
+    for (int i = 1; i < argc; i++) {
         char *copy = strdup(argv[i]);
         if (!copy) {
             fprintf(stderr, "Out of memory duplicating filename: %s\n", argv[i]);
             continue;
         }
-        /* Use tfind with our custom comparator */
         ENTRY *found = tfind(copy, &dup_tree, cmpstr);
         if (found) {
-            /* Duplicate found; free our duplicate copy */
             free(copy);
         } else {
             tsearch(copy, &dup_tree, cmpstr);
@@ -70,7 +96,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* If no valid files, we cannot proceed */
     if (validCount == 0) {
         fprintf(stderr, "No valid files to open.\n");
         free(validFiles);
@@ -79,27 +104,47 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Check each file with ImageMagick (using Ping) */
-    for (i = 0; i < validCount; i++) {
-        printf("Testing %s...", validFiles[i]);
-        MagickWand *testWand = NewMagickWand();
-        if (MagickPingImage(testWand, validFiles[i]) == MagickFalse) {
-            fprintf(stderr, "Failed.\nWarning: ignoring invalid file: %s\n", validFiles[i]);
+    /* Check each file using `file` for MIME and ImageMagick for ping */
+    for (int i = 0; i < validCount; i++) {
+        int validImage = 1;
+
+        /* Check MIME type using the file command */
+        if (!check_mime(validFiles[i])) {
+            validImage = 0;
+        }
+
+        /* If MIME is valid, check if the image can be pinged */
+        if (validImage) {
+            MagickWand *testWand = NewMagickWand();
+            if (MagickPingImage(testWand, validFiles[i]) == MagickFalse) {
+                fprintf(stderr, "File %s excluded: failed to ping.\n", validFiles[i]);
+                validImage = 0;
+            }
+            DestroyMagickWand(testWand);
+        }
+
+        /* Exclude file if any check fails */
+        if (!validImage) {
             free(validFiles[i]);
             /* Shift remaining pointers down */
             for (int j = i; j < validCount - 1; j++) {
                 validFiles[j] = validFiles[j + 1];
             }
             validCount--;
-            i--; /* re-check new file at this index */
+            i--; /* Re-check the new file at this index */
         } else {
-            printf("OK.\n");
         }
-        DestroyMagickWand(testWand);
     }
 
     /* Clean up the duplicate tree without freeing the keys */
     tdestroy(dup_tree, noop_free);
+
+    if (validCount == 0) {
+        fprintf(stderr, "No valid image files after checking MIME and ping.\n");
+        free(validFiles);
+        MagickWandTerminus();
+        return 1;
+    }
 
     /* Load user config (keybinds, bookmarks, etc.) */
     MsxivConfig config;
@@ -118,7 +163,7 @@ int main(int argc, char **argv)
     Window win = 0;
     if (viewer_init(&dpy, &win, &vdata, &config) != 0) {
         fprintf(stderr, "Viewer initialization failed.\n");
-        for (i = 0; i < validCount; i++) {
+        for (int i = 0; i < validCount; i++) {
             free(validFiles[i]);
         }
         free(validFiles);
@@ -133,7 +178,7 @@ int main(int argc, char **argv)
     viewer_cleanup(dpy);
 
     /* Free allocated file list */
-    for (i = 0; i < validCount; i++) {
+    for (int i = 0; i < validCount; i++) {
         free(validFiles[i]);
     }
     free(validFiles);
@@ -143,4 +188,3 @@ int main(int argc, char **argv)
 
     return 0;
 }
-
