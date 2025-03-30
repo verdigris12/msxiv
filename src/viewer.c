@@ -306,6 +306,7 @@ static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, 
 /* Helper structure for passing arguments to the thumbnail thread */
 typedef struct {
     Display *dpy;
+    Window win;
     int fileCount;
     char **files;
 } ThumbnailThreadArgs;
@@ -314,6 +315,11 @@ typedef struct {
 static void *thumbnail_thread_func(void *arg) {
     ThumbnailThreadArgs *targs = (ThumbnailThreadArgs *)arg;
     generate_gallery_thumbnails(targs->dpy, targs->fileCount, targs->files);
+    /* Force a redraw so that an Expose event is generated and render_gallery gets called */
+    if (g_gallery_mode) {
+      XClearWindow(targs->dpy, targs->win);
+      XSync(targs->dpy, False);
+    }
     free(targs);
     return NULL;
 }
@@ -580,6 +586,11 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     *win = XCreateSimpleWindow(*dpy, RootWindow(*dpy, screen),
                                0, 0, 800, 600, 1,
                                BlackPixel(*dpy, screen), WhitePixel(*dpy, screen));
+    Colormap cmap = DefaultColormap(*dpy, screen);
+    XColor xcol;
+    if (XParseColor(*dpy, cmap, "#000000", &xcol) && XAllocColor(*dpy, cmap, &xcol)){
+      XSetWindowBackground(*dpy, *win, xcol.pixel);
+    }
     XSelectInput(*dpy, *win, ExposureMask | KeyPressMask |
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
     wmDeleteMessage = XInternAtom(*dpy, "WM_DELETE_WINDOW", False);
@@ -619,6 +630,7 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
         ThumbnailThreadArgs *targs = malloc(sizeof(ThumbnailThreadArgs));
         if (targs) {
             targs->dpy = *dpy;
+            targs->win = *win;
             targs->fileCount = vdata->fileCount;
             targs->files = vdata->files;
             pthread_t thumb_thread;
