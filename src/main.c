@@ -2,116 +2,145 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <search.h>
 #include <MagickWand/MagickWand.h>
 
 #include "viewer.h"
 #include "config.h"
 
-/* Simple helper to see if a path is already in our array of unique files */
-static int is_duplicate(const char *path, char **files, int count)
-{
-	int i;
-	for (i = 0; i < count; i++) {
-		if (strcmp(path, files[i]) == 0)
-			return 1;
-	}
-	return 0;
+/* Custom comparator for tsearch/tfind.
+   Keys are char* so we compare the strings directly. */
+static int cmpstr(const void *a, const void *b) {
+    const char *s1 = a;
+    const char *s2 = b;
+    return strcmp(s1, s2);
 }
 
-/* Check if the file can be opened by ImageMagick */
-static int can_open_image(const char *path)
-{
-	MagickWand *testWand = NewMagickWand();
-	if (MagickPingImage(testWand, path) == MagickFalse) {
-		DestroyMagickWand(testWand);
-		return 0;
-	}
-	DestroyMagickWand(testWand);
-	return 1;
+/* No‑op free callback for tdestroy.
+   Since validFiles owns the duplicated strings, we don't want tdestroy to free them. */
+static void noop_free(void *node) {
+    /* do nothing */
 }
 
 int main(int argc, char **argv)
 {
-	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <image1> [image2 ...]\n", argv[0]);
-		return 1;
-	}
+    /* Initialize Xlib for multi-threading */
+    if (!XInitThreads()) {
+        fprintf(stderr, "Failed to initialize Xlib threads.\n");
+        return 1;
+    }
 
-	/* Initialize ImageMagick library */
-	MagickWandGenesis();
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <image1> [image2 ...]\n", argv[0]);
+        return 1;
+    }
 
-	/* Prepare dynamic list for deduped, valid image paths */
-	char **validFiles = (char **)malloc(sizeof(char *) * (argc - 1));
-	if (!validFiles) {
-		fprintf(stderr, "Allocation failed.\n");
-		MagickWandTerminus();
-		return 1;
-	}
-	int validCount = 0;
+    /* Initialize ImageMagick library */
+    MagickWandGenesis();
 
-	/* Collect only unique and valid files */
-	int i;
-	for (i = 1; i < argc; i++) {
-		if (!is_duplicate(argv[i], validFiles, validCount)) {
-			if (can_open_image(argv[i])) {
-				validFiles[validCount] = strdup(argv[i]);
-				if (!validFiles[validCount]) {
-					fprintf(stderr, "Out of memory.\n");
-					MagickWandTerminus();
-					return 1;
-				}
-				validCount++;
-			} else {
-				fprintf(stderr, "Warning: ignoring invalid file: %s\n", argv[i]);
-			}
-		}
-	}
+    /* Allocate an array to hold valid, unique image paths */
+    char **validFiles = malloc(sizeof(char *) * (argc - 1));
+    if (!validFiles) {
+        fprintf(stderr, "Allocation failed.\n");
+        MagickWandTerminus();
+        return 1;
+    }
+    int validCount = 0;
 
-	/* If no valid files, we cannot proceed */
-	if (validCount == 0) {
-		fprintf(stderr, "No valid files to open.\n");
-		free(validFiles);
-		MagickWandTerminus();
-		return 1;
-	}
+    /* Create a binary search tree root for duplicate checking.
+       The tree is used solely for duplicate detection. */
+    void *dup_tree = NULL;
+    int i;
+    for (i = 1; i < argc; i++) {
+        printf("%d %s\n", i, argv[i]);
+        char *copy = strdup(argv[i]);
+        if (!copy) {
+            fprintf(stderr, "Out of memory duplicating filename: %s\n", argv[i]);
+            continue;
+        }
+        /* Use tfind with our custom comparator */
+        ENTRY *found = tfind(copy, &dup_tree, cmpstr);
+        if (found) {
+            /* Duplicate found; free our duplicate copy */
+            free(copy);
+        } else {
+            tsearch(copy, &dup_tree, cmpstr);
+            validFiles[validCount] = copy;
+            validCount++;
+        }
+    }
 
-	/* Load user config (keybinds, bookmarks, etc.) */
-	MsxivConfig config;
-	if (load_config(&config) < 0) {
-		fprintf(stderr, "Warning: could not load config.\n");
-	}
+    /* If no valid files, we cannot proceed */
+    if (validCount == 0) {
+        fprintf(stderr, "No valid files to open.\n");
+        free(validFiles);
+        tdestroy(dup_tree, noop_free);
+        MagickWandTerminus();
+        return 1;
+    }
 
-	/* Build ViewerData from validFiles. */
-	ViewerData vdata;
-	vdata.fileCount = validCount;
-	vdata.files = validFiles;
-	vdata.currentIndex = 0;
+    /* Check each file with ImageMagick (using Ping) */
+    for (i = 0; i < validCount; i++) {
+        printf("Testing %s...", validFiles[i]);
+        MagickWand *testWand = NewMagickWand();
+        if (MagickPingImage(testWand, validFiles[i]) == MagickFalse) {
+            fprintf(stderr, "Failed.\nWarning: ignoring invalid file: %s\n", validFiles[i]);
+            free(validFiles[i]);
+            /* Shift remaining pointers down */
+            for (int j = i; j < validCount - 1; j++) {
+                validFiles[j] = validFiles[j + 1];
+            }
+            validCount--;
+            i--; /* re-check new file at this index */
+        } else {
+            printf("OK.\n");
+        }
+        DestroyMagickWand(testWand);
+    }
 
-	/* Initialize viewer */
-	Display *dpy = NULL;
-	Window win = 0;
-	if (viewer_init(&dpy, &win, &vdata, &config) != 0) {
-		fprintf(stderr, "Viewer initialization failed.\n");
-		MagickWandTerminus();
-		return 1;
-	}
+    /* Clean up the duplicate tree without freeing the keys */
+    tdestroy(dup_tree, noop_free);
 
-	/* Run main event loop */
-	viewer_run(dpy, win, &vdata);
+    /* Load user config (keybinds, bookmarks, etc.) */
+    MsxivConfig config;
+    if (load_config(&config) < 0) {
+        fprintf(stderr, "Warning: could not load config.\n");
+    }
 
-	/* Cleanup viewer */
-	viewer_cleanup(dpy);
+    /* Build ViewerData from validFiles */
+    ViewerData vdata;
+    vdata.fileCount = validCount;
+    vdata.files = validFiles;
+    vdata.currentIndex = 0;
 
-	/* Free allocated file list */
-	int j;
-	for (j = 0; j < validCount; j++) {
-		free(validFiles[j]);
-	}
-	free(validFiles);
+    /* Initialize viewer */
+    Display *dpy = NULL;
+    Window win = 0;
+    if (viewer_init(&dpy, &win, &vdata, &config) != 0) {
+        fprintf(stderr, "Viewer initialization failed.\n");
+        for (i = 0; i < validCount; i++) {
+            free(validFiles[i]);
+        }
+        free(validFiles);
+        MagickWandTerminus();
+        return 1;
+    }
 
-	/* Terminate ImageMagick */
-	MagickWandTerminus();
+    /* Run main event loop */
+    viewer_run(dpy, win, &vdata);
 
-	return 0;
+    /* Cleanup viewer */
+    viewer_cleanup(dpy);
+
+    /* Free allocated file list */
+    for (i = 0; i < validCount; i++) {
+        free(validFiles[i]);
+    }
+    free(validFiles);
+
+    /* Terminate ImageMagick */
+    MagickWandTerminus();
+
+    return 0;
 }
 

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <pthread.h>
 
 #include <X11/Xutil.h>
 #include <MagickWand/MagickWand.h>
@@ -56,7 +57,7 @@ static int         g_pan_y        = 0;
 static char g_filename[1024] = {0};
 static MsxivConfig *g_config = NULL;
 
-/* For caching scaled image dimensions to avoid unnecessary regenerations */
+/* For caching scaled image dimensions */
 static int g_last_sw = 0;
 static int g_last_sh = 0;
 static double g_last_zoom = 0.0;
@@ -99,7 +100,7 @@ static void fit_zoom(Display *dpy, Window win);
 static void load_image(Display *dpy, Window win, const char *filename);
 static void free_gallery_thumbnails(int fileCount);
 
-/* --- Tab-completion and path completion logic --- */
+/* --- Tab and path completion logic --- */
 static const char *g_known_cmds[] = {
     "save",
     "save_as",
@@ -182,7 +183,6 @@ static int is_command_in_list(const char *str, const char *list[]) {
 static void try_tab_completion(void) {
     if (!g_command_mode || g_command_len <= 0) return;
     if (g_command_input[0] != ':') return;
-
     char *space = strchr(g_command_input, ' ');
     if (!space) {
         const char *prefix = g_command_input + 1;
@@ -263,9 +263,7 @@ static void try_tab_completion(void) {
  * GALLERY THUMBNAILS
  * =========================
  *
- * The thumbnail creation now mirrors the logic in generate_scaled_ximg:
- * we use a MagickWand clone, resize the image with Lanczos, export as 32-bit RGBA/BGRA,
- * and allocate an XImage accordingly. In a production system you might add caching per file.
+ * The thumbnail generation now mirrors the main image scaling logic.
  */
 static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, int *out_h) {
     MagickWand *twand = NewMagickWand();
@@ -275,7 +273,6 @@ static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, 
     }
     int orig_w = (int)MagickGetImageWidth(twand);
     int orig_h = (int)MagickGetImageHeight(twand);
-
     double sx = (double)THUMB_SIZE_W / orig_w;
     double sy = (double)THUMB_SIZE_H / orig_h;
     double scale = (sx < sy) ? sx : sy;
@@ -285,27 +282,16 @@ static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, 
     MagickResizeImage(twand, new_w, new_h, LanczosFilter);
     MagickSetImageFormat(twand, "RGBA");
 
-    /* Create an XImage using the same 32-bit logic as the main image */
     int screen = DefaultScreen(dpy);
     Visual *visual = DefaultVisual(dpy, screen);
     XImage *xi = XCreateImage(dpy, visual,
                               DefaultDepth(dpy, screen),
                               ZPixmap, 0,
-                              NULL,
-                              new_w, new_h,
-                              32, 0);
-    if (!xi) {
-        DestroyMagickWand(twand);
-        return NULL;
-    }
+                              NULL, new_w, new_h, 32, 0);
+    if (!xi) { DestroyMagickWand(twand); return NULL; }
     xi->data = (char *)malloc(xi->bytes_per_line * new_h);
-    if (!xi->data) {
-        XFree(xi);
-        DestroyMagickWand(twand);
-        return NULL;
-    }
-    const char *pixFormat = "BGRA"; // Assume little-endian for simplicity
-    size_t length = new_w * new_h * 4;
+    if (!xi->data) { XFree(xi); DestroyMagickWand(twand); return NULL; }
+    const char *pixFormat = "BGRA";
     if (MagickExportImagePixels(twand, 0, 0, new_w, new_h, pixFormat, CharPixel, xi->data) == MagickFalse) {
         free(xi->data);
         XFree(xi);
@@ -317,7 +303,23 @@ static XImage *create_thumbnail(Display *dpy, const char *filename, int *out_w, 
     return xi;
 }
 
-static void generate_gallery_thumbnails(Display *dpy, int fileCount, char **files) {
+/* Helper structure for passing arguments to the thumbnail thread */
+typedef struct {
+    Display *dpy;
+    int fileCount;
+    char **files;
+} ThumbnailThreadArgs;
+
+/* Thread function to generate gallery thumbnails */
+static void *thumbnail_thread_func(void *arg) {
+    ThumbnailThreadArgs *targs = (ThumbnailThreadArgs *)arg;
+    generate_gallery_thumbnails(targs->dpy, targs->fileCount, targs->files);
+    free(targs);
+    return NULL;
+}
+
+/* This function remains unchanged except that it may be called from a separate thread */
+void generate_gallery_thumbnails(Display *dpy, int fileCount, char **files) {
     g_thumbs = calloc(fileCount, sizeof(GalleryThumb));
     if (!g_thumbs) {
         fprintf(stderr, "Failed to allocate gallery thumbnails.\n");
@@ -325,7 +327,6 @@ static void generate_gallery_thumbnails(Display *dpy, int fileCount, char **file
     }
     for (int i = 0; i < fileCount; i++) {
         int tw = 0, th = 0;
-        /* Each thumbnail is generated once using the optimized scaling logic */
         XImage *xi = create_thumbnail(dpy, files[i], &tw, &th);
         g_thumbs[i].ximg = xi;
         g_thumbs[i].w = tw;
@@ -351,10 +352,8 @@ static void render_gallery(Display *dpy, Window win, ViewerData *vdata) {
     XWindowAttributes xwa;
     XGetWindowAttributes(dpy, win, &xwa);
     GC gc = DefaultGC(dpy, DefaultScreen(dpy));
-
     XSetForeground(dpy, gc, g_gallery_bg_pixel);
     XFillRectangle(dpy, win, gc, 0, 0, xwa.width, xwa.height);
-
     int count = vdata->fileCount;
     for (int i = 0; i < count; i++) {
         GalleryThumb *th = &g_thumbs[i];
@@ -391,23 +390,17 @@ static void generate_scaled_ximg(Display *dpy) {
     int sw = (int)(g_img_width * g_zoom);
     int sh = (int)(g_img_height * g_zoom);
     if (sw <= 0 || sh <= 0) return;
-
-    /* Use caching: if dimensions and zoom haven’t changed, skip regeneration */
     if (g_scaled_ximg && sw == g_last_sw && sh == g_last_sh &&
         fabs(g_zoom - g_last_zoom) < 1e-6)
         return;
-
     free_scaled_ximg();
     MagickWand *tmp = CloneMagickWand(g_wand);
     MagickResizeImage(tmp, sw, sh, LanczosFilter);
-
     int screen = DefaultScreen(dpy);
     int depth = DefaultDepth(dpy, screen);
     Visual *visual = DefaultVisual(dpy, screen);
-
     fprintf(stderr, "Using visual depth=%d, red_mask=0x%lx, green_mask=0x%lx, blue_mask=0x%lx\n",
             depth, visual->red_mask, visual->green_mask, visual->blue_mask);
-
     XImage *xi = XCreateImage(dpy, visual,
                               depth, ZPixmap, 0,
                               NULL, sw, sh, 32, 0);
@@ -423,7 +416,6 @@ static void generate_scaled_ximg(Display *dpy) {
         DestroyMagickWand(tmp);
         return;
     }
-
     const char *pixFormat;
     if (visual->red_mask == 0xff0000 && visual->green_mask == 0xff00 && visual->blue_mask == 0xff)
         pixFormat = "BGRA";
@@ -433,7 +425,6 @@ static void generate_scaled_ximg(Display *dpy) {
         fprintf(stderr, "Unsupported visual masks. Using BGRA as fallback.\n");
         pixFormat = "BGRA";
     }
-
     if (MagickExportImagePixels(tmp, 0, 0, sw, sh, pixFormat, CharPixel, xi->data) == MagickFalse) {
         fprintf(stderr, "Failed to export pixels.\n");
         free(xi->data);
@@ -442,8 +433,7 @@ static void generate_scaled_ximg(Display *dpy) {
         return;
     }
     g_scaled_ximg = xi;
-    g_scaled_w = sw;
-    g_scaled_h = sh;
+    g_scaled_w = sw; g_scaled_h = sh;
     g_last_sw = sw; g_last_sh = sh; g_last_zoom = g_zoom;
     DestroyMagickWand(tmp);
 }
@@ -462,7 +452,6 @@ static void fit_zoom(Display *dpy, Window win) {
 static void load_image(Display *dpy, Window win, const char *filename) {
     free_scaled_ximg();
     if (g_wand) { DestroyMagickWand(g_wand); g_wand = NULL; }
-
     g_wand = NewMagickWand();
     if (MagickReadImage(g_wand, filename) == MagickFalse) {
         fprintf(stderr, "Failed to read image: %s\n", filename);
@@ -476,7 +465,6 @@ static void load_image(Display *dpy, Window win, const char *filename) {
     g_img_width  = (int)MagickGetImageWidth(g_wand);
     g_img_height = (int)MagickGetImageHeight(g_wand);
     g_fit_mode = 1; g_zoom = 1.0; g_pan_x = 0; g_pan_y = 0;
-    if (g_status_mode == 0) { /* g_filename is used in render_image() */ }
     fit_zoom(dpy, win);
 }
 
@@ -500,13 +488,11 @@ static void render_image(Display *dpy, Window win) {
         }
         return;
     }
-
     XWindowAttributes xwa;
     XGetWindowAttributes(dpy, win, &xwa);
     GC gc = DefaultGC(dpy, DefaultScreen(dpy));
     XSetForeground(dpy, gc, g_bg_pixel);
     XFillRectangle(dpy, win, gc, 0, 0, xwa.width, xwa.height);
-
     int copy_w = (g_scaled_w < xwa.width) ? g_scaled_w : xwa.width;
     int copy_h = (g_scaled_h < xwa.height) ? g_scaled_h : xwa.height;
     if (g_scaled_w <= xwa.width) g_pan_x = 0;
@@ -515,19 +501,15 @@ static void render_image(Display *dpy, Window win) {
     if (g_scaled_h <= xwa.height) g_pan_y = 0;
     else if (g_pan_y < 0) g_pan_y = 0;
     else if (g_pan_y > g_scaled_h - copy_h) g_pan_y = g_scaled_h - copy_h;
-
     int dx = (g_scaled_w < xwa.width) ? (xwa.width - g_scaled_w) / 2 : 0;
     int dy = (g_scaled_h < xwa.height) ? (xwa.height - g_scaled_h) / 2 : 0;
-
     XImage sub_ximg;
     memcpy(&sub_ximg, g_scaled_ximg, sizeof(XImage));
     sub_ximg.width = copy_w; sub_ximg.height = copy_h;
     int rowbytes = g_scaled_ximg->bytes_per_line;
     unsigned char *sub_ptr = (unsigned char *)g_scaled_ximg->data + (g_pan_y * rowbytes) + (g_pan_x * 4);
     sub_ximg.data = (char *)sub_ptr;
-
     XPutImage(dpy, win, gc, &sub_ximg, 0, 0, dx, dy, copy_w, copy_h);
-
     int bar_y = xwa.height - CMD_BAR_HEIGHT;
     XSetForeground(dpy, gc, g_cmdbar_bg_pixel);
     XFillRectangle(dpy, win, gc, 0, bar_y, xwa.width, CMD_BAR_HEIGHT);
@@ -592,7 +574,6 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     g_wand = NULL; g_gallery_mode = 0; g_thumbs = NULL; g_gallery_select = 0;
     g_command_input[0] = '\0'; g_command_len = 0; g_command_mode = 0;
     g_last_cmd_result[0] = '\0'; g_status_mode = 0;
-
     *dpy = XOpenDisplay(NULL);
     if (!*dpy) { fprintf(stderr, "Cannot open display\n"); return -1; }
     int screen = DefaultScreen(*dpy);
@@ -606,10 +587,8 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
     XMapWindow(*dpy, *win);
     XEvent e;
     while (1) { XNextEvent(*dpy, &e); if (e.type == MapNotify) break; }
-
     g_cmdFont = XLoadQueryFont(*dpy, CMD_BAR_FONT);
     if (!g_cmdFont) g_cmdFont = XLoadQueryFont(*dpy, "fixed");
-
     {
         Colormap cmap = DefaultColormap(*dpy, screen);
         XColor xcol;
@@ -635,9 +614,18 @@ int viewer_init(Display **dpy, Window *win, ViewerData *vdata, MsxivConfig *conf
         else
             g_gallery_bg_pixel = BlackPixel(*dpy, screen);
     }
-
-    if (vdata->fileCount > 1)
-        generate_gallery_thumbnails(*dpy, vdata->fileCount, vdata->files);
+    /* Spawn a separate thread for thumbnail generation if more than one file is present */
+    if (vdata->fileCount > 1) {
+        ThumbnailThreadArgs *targs = malloc(sizeof(ThumbnailThreadArgs));
+        if (targs) {
+            targs->dpy = *dpy;
+            targs->fileCount = vdata->fileCount;
+            targs->files = vdata->files;
+            pthread_t thumb_thread;
+            pthread_create(&thumb_thread, NULL, thumbnail_thread_func, targs);
+            pthread_detach(thumb_thread);
+        }
+    }
     if (vdata->fileCount > 0)
         load_image(*dpy, *win, vdata->files[vdata->currentIndex]);
     return 0;
@@ -800,12 +788,9 @@ void viewer_run(Display *dpy, Window win, ViewerData *vdata) {
 
 void viewer_cleanup(Display *dpy) {
     free_scaled_ximg();
-    /* If gallery thumbnails were generated, free them.
-       (vdata->fileCount is not directly accessible here) */
     if (g_wand) { DestroyMagickWand(g_wand); g_wand = NULL; }
     if (dpy) {
         if (g_cmdFont) { /* Typically: XFreeFont(dpy, g_cmdFont); */ }
         XCloseDisplay(dpy);
     }
 }
-
